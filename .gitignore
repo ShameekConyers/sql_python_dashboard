@@ -1,6 +1,11 @@
 # Secrets & environment
 .env
+.env.*
+!.env.example
 *.key
+*.pem
+*.crt
+credentials*.json
 
 # Data — only seed.db is committed; raw API cache and full DB are local only
 data/raw/
@@ -42,3 +47,7 @@ env/
 # Logs
 *.log
 logs/
+
+# Personal Documentation - Not for the public Repo
+docs/private_docs/
+docs/draft_site.md
