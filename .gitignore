@@ -7,9 +7,10 @@
 *.crt
 credentials*.json
 
-# Data — only seed.db is committed; raw API cache and full DB are local only
+# Data — only seed.db is committed; raw API cache, full DB, and exports are local only
 data/raw/
 data/full.db
+data/exports/
 
 # Python
 __pycache__/
@@ -50,4 +51,3 @@ logs/
 
 # Personal Documentation - Not for the public Repo
 docs/private_docs/
-docs/draft_site.md
