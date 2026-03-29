@@ -1,7 +1,7 @@
 """COVID period adjustment using ARIMA counterfactual modeling.
 
 Fits ARIMA models on pre-COVID data for each FRED series, forecasts through
-the COVID window (Mar 2020 - Jun 2021), and tapers back to actual data with
+the COVID window (Mar 2020 - Jan 2022), and tapers back to actual data with
 a linear blend. Results are stored in the ``value_covid_adjusted`` column.
 
 The adjustment treats COVID as a 500-year outlier that contaminates rolling
@@ -43,7 +43,7 @@ logger: logging.Logger = logging.getLogger(__name__)
 
 # COVID window boundaries
 COVID_START: str = "2020-03-01"
-COVID_END: str = "2021-06-01"
+COVID_END: str = "2022-01-01"
 TAPER_MONTHS: int = 3
 
 # Series that need special handling

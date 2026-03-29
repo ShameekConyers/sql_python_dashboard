@@ -8,7 +8,6 @@ insight blocks when available.
 from __future__ import annotations
 
 import json
-import os
 import sqlite3
 from pathlib import Path
 
@@ -229,14 +228,14 @@ def add_recession_shading(fig: go.Figure, df_recession: pd.DataFrame) -> None:
         df_recession: DataFrame with 'date' and 'in_recession' columns.
     """
     in_rec = False
-    start = None
+    start: str = ""
     for _, row in df_recession.iterrows():
         if row["in_recession"] == 1 and not in_rec:
-            start = row["date"]
+            start = str(row["date"])
             in_rec = True
         elif row["in_recession"] == 0 and in_rec:
             add_annotated_vrect(
-                fig, start, row["date"],
+                fig, start, str(row["date"]),
                 fillcolor=COLORS["recession"],
                 text="Recession", font_color="gray",
             )
@@ -311,6 +310,8 @@ def render_ai_insight_block(metric_key: str, insight_type: str, full: bool = Fal
     try:
         claims = json.loads(insight["claims_json"])
         verification = json.loads(insight["verification_json"])
+        # Dual-key lookup: verification keys may be strings ("0") or ints (0)
+        # depending on JSON serialization path
         pass_count: int = sum(
             1
             for i in range(len(claims))
@@ -855,9 +856,13 @@ with st.sidebar:
     metadata = load_series_metadata(use_full)
     date_min_db, date_max_db = get_date_range(use_full)
 
+    default_start = max(
+        pd.to_datetime("2022-01-01").date(),
+        pd.to_datetime(date_min_db).date(),
+    )
     date_range = st.date_input(
         "Date range",
-        value=(pd.to_datetime(date_min_db).date(), pd.to_datetime(date_max_db).date()),
+        value=(default_start, pd.to_datetime(date_max_db).date()),
         min_value=pd.to_datetime(date_min_db).date(),
         max_value=pd.to_datetime(date_max_db).date(),
     )
@@ -1051,14 +1056,14 @@ with tab_recession:
                 rec_q3 = df_q3[df_q3["nber_recession"] == 1]
                 if not rec_q3.empty:
                     in_rec = False
-                    start = None
+                    start: str = ""
                     for _, row in df_q3.iterrows():
                         if row["nber_recession"] == 1 and not in_rec:
-                            start = row["date"]
+                            start = str(row["date"])
                             in_rec = True
                         elif row["nber_recession"] == 0 and in_rec:
                             add_annotated_vrect(
-                                fig_q3, start, row["date"],
+                                fig_q3, start, str(row["date"]),
                                 fillcolor=COLORS["recession"],
                             )
                             in_rec = False

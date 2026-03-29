@@ -205,16 +205,16 @@ class TestApplyTaper:
 
         result: np.ndarray = covid_adjustment._apply_taper(forecast, actual, dates)
 
-        # First few months (before taper zone starting at COVID_END - 3mo = 2021-03-01)
-        # are all before the taper, so they should equal the forecast
+        # All dates are before the taper zone (COVID_END - 3mo = 2021-10-01),
+        # so they should equal the forecast
         assert result[0] == pytest.approx(10.0)
         assert result[1] == pytest.approx(10.0)
 
     def test_taper_zone_blends(self) -> None:
         """Within the taper zone, values are between forecast and actual."""
-        # Create dates spanning into the taper zone (last 3 months before COVID_END)
+        # Taper zone: COVID_END - 3mo to COVID_END + 1mo = 2021-10-01 to 2022-02-01
         dates: pd.DatetimeIndex = pd.to_datetime(
-            ["2021-03-01", "2021-04-01", "2021-05-01", "2021-06-01"]
+            ["2021-10-01", "2021-11-01", "2021-12-01", "2022-01-01"]
         )
         forecast: np.ndarray = np.array([10.0, 10.0, 10.0, 10.0])
         actual: np.ndarray = np.array([20.0, 20.0, 20.0, 20.0])
@@ -255,9 +255,9 @@ class TestAdjustBinarySeries:
         """COVID-window observations get value_covid_adjusted = 0."""
         dates: list[str] = [
             "2019-12-01", "2020-03-01", "2020-06-01",
-            "2021-06-01", "2021-07-01",
+            "2021-06-01", "2022-01-01", "2022-02-01",
         ]
-        values: list[float] = [0.0, 1.0, 1.0, 1.0, 0.0]
+        values: list[float] = [0.0, 1.0, 1.0, 1.0, 1.0, 0.0]
         conn: sqlite3.Connection = _make_db("USREC", "monthly", dates, values)
 
         covid_adjustment._adjust_binary_series(conn, "USREC")
@@ -268,14 +268,14 @@ class TestAdjustBinarySeries:
         ).fetchall()
 
         for d, raw, adj in rows:
-            if "2020-03-01" <= d <= "2021-06-01":
+            if "2020-03-01" <= d <= "2022-01-01":
                 assert adj == 0.0, f"Expected 0 for {d}, got {adj}"
             else:
                 assert adj == raw, f"Non-COVID obs {d} should be unchanged"
 
     def test_leaves_non_covid_unchanged(self) -> None:
         """Observations outside the COVID window keep their original values."""
-        dates: list[str] = ["2019-01-01", "2022-01-01"]
+        dates: list[str] = ["2019-01-01", "2022-02-01"]
         values: list[float] = [0.0, 0.0]
         conn: sqlite3.Connection = _make_db("USREC", "monthly", dates, values)
 
@@ -299,13 +299,15 @@ class TestAdjustStandardSeries:
 
     def test_updates_covid_window_observations(self) -> None:
         """COVID-window observations get different value_covid_adjusted values."""
-        # Build dates: 24 months pre-COVID + 16 COVID months
+        # Build dates: 24 months pre-COVID + 23 COVID months (Mar 2020 - Jan 2022)
         pre_dates: list[str] = [f"{2018 + (i // 12)}-{(i % 12) + 1:02d}-01" for i in range(24)]
         covid_dates: list[str] = [
             "2020-03-01", "2020-04-01", "2020-05-01", "2020-06-01",
             "2020-07-01", "2020-08-01", "2020-09-01", "2020-10-01",
             "2020-11-01", "2020-12-01", "2021-01-01", "2021-02-01",
             "2021-03-01", "2021-04-01", "2021-05-01", "2021-06-01",
+            "2021-07-01", "2021-08-01", "2021-09-01", "2021-10-01",
+            "2021-11-01", "2021-12-01", "2022-01-01",
         ]
         all_dates: list[str] = pre_dates + covid_dates
         all_values: list[float] = [3.5 + 0.05 * i for i in range(len(all_dates))]
@@ -327,7 +329,7 @@ class TestAdjustStandardSeries:
         # Check that COVID window adjusted values differ from raw
         rows: list[tuple] = conn.execute(
             """SELECT date, value, value_covid_adjusted FROM observations
-               WHERE series_id = 'UNRATE' AND date >= '2020-03-01' AND date <= '2021-06-01'
+               WHERE series_id = 'UNRATE' AND date >= '2020-03-01' AND date <= '2022-01-01'
                ORDER BY date""",
         ).fetchall()
 

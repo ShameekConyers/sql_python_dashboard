@@ -90,7 +90,7 @@ def _pull_series(fred: Fred, series_info: SeriesInfo) -> dict:
     records: list[dict] = []
     for ts, value in observations.items():
         record: dict = {"date": str(ts)[:10]}
-        if value != value:  # NaN check without importing math
+        if value != value:  # IEEE 754: NaN != NaN, avoids importing math
             record["value"] = None
         else:
             record["value"] = float(value)

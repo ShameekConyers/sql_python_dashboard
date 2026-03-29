@@ -1,0 +1,22 @@
+name: Keep Streamlit Alive
+
+on:
+  schedule:
+    # Ping every 30 minutes to prevent Streamlit Community Cloud from sleeping
+    - cron: "*/30 * * * *"
+  workflow_dispatch: # Allow manual trigger for testing
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping Streamlit app
+        run: |
+          response=$(curl -s -o /dev/null -w "%{http_code}" --max-time 30 "${{ secrets.STREAMLIT_APP_URL }}")
+          echo "Status: $response"
+          if [ "$response" -ge 200 ] && [ "$response" -lt 400 ]; then
+            echo "App is awake."
+          else
+            echo "Warning: Got status $response. App may be down."
+            exit 1
+          fi

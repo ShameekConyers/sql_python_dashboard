@@ -35,6 +35,8 @@ logger: logging.Logger = logging.getLogger(__name__)
 
 DEFAULT_MODEL: str = "llama3.1:8b"
 OLLAMA_BASE_URL: str = "http://localhost:11434"
+CHATGPT_LAUNCH: str = "2022-11"
+"""Year-month of ChatGPT public release, used as an analytical anchor point."""
 
 SYSTEM_PROMPT: str = """\
 You are an economic analyst writing insights for a macro economic dashboard \
@@ -233,7 +235,7 @@ def _compute_change(
         conn, series_id, period_start, period_end,
         "end", use_raw, per_capita,
     )
-    if not start_val or not end_val or start_val == 0:
+    if start_val is None or end_val is None or start_val == 0:
         return 0.0
     return round((end_val - start_val) / start_val * 100, 2)
 
@@ -267,7 +269,7 @@ def _compute_pct_of_start(
         conn, series_id, period_start, period_end,
         "end", use_raw, per_capita,
     )
-    if not start_val or not end_val or start_val == 0:
+    if start_val is None or end_val is None or start_val == 0:
         return 0.0
     return round(end_val / start_val * 100, 2)
 
@@ -495,7 +497,7 @@ def _claims_info_vs_trades(
     """
     latest: str = _latest_month(conn, "USINFO")
     earliest: str = _earliest_month(conn, "USINFO")
-    chatgpt: str = "2022-11"
+    chatgpt: str = CHATGPT_LAUNCH
 
     info_full_chg: float = _compute_change(
         conn, "USINFO", earliest, latest, per_capita=True,
@@ -698,7 +700,7 @@ def _claims_power_vs_info(
         List of structured claim dicts.
     """
     latest: str = _latest_month(conn, "IPG2211S")
-    chatgpt: str = "2022-11"
+    chatgpt: str = CHATGPT_LAUNCH
 
     power_chg: float = _compute_change(
         conn, "IPG2211S", chatgpt, latest,
@@ -1252,7 +1254,7 @@ def _context_power_vs_info(conn: sqlite3.Connection) -> dict[str, Any]:
     df["info_idx"] = df["info_val"] / info_base * 100
 
     # Post-ChatGPT (Nov 2022)
-    post_mask: pd.Series = df["month"] >= "2022-11"
+    post_mask: pd.Series = df["month"] >= CHATGPT_LAUNCH
     post: pd.DataFrame = df[post_mask]
 
     if len(post) > 0:
