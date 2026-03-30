@@ -281,11 +281,11 @@ def style_figure(fig: go.Figure, title: str = "") -> go.Figure:
         The styled figure.
     """
     fig.update_layout(
-        title=title,
+        title=dict(text=title, y=0.98, yanchor="top"),
         template="plotly_white",
         hovermode="x unified",
-        margin=dict(l=40, r=20, t=50, b=30),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        margin=dict(l=50, r=20, t=80, b=30),
+        legend=dict(orientation="h", yanchor="top", y=-0.15, xanchor="center", x=0.5),
         xaxis=dict(tickformat="%b %Y"),
     )
     return fig
