@@ -4,13 +4,6 @@ An end-to-end analytics pipeline that pulls macroeconomic data from the FRED API
 
 ---
 
-## Live Dashboard
-
-<!-- Replace YOUR_APP_URL with the deployed Streamlit Community Cloud URL -->
-<iframe src="YOUR_APP_URL/?embed=true" width="100%" height="800" frameborder="0" allowfullscreen></iframe>
-
----
-
 ## Business Question
 
 How do traditional recession indicators (yield curve, GDP, inflation) interact with the diverging employment trends between AI-disrupted white-collar sectors and AI-resistant skilled trades? As data center energy demand surges and information-sector employment shifts, what does the macro picture look like for urban knowledge workers versus tradespeople?
@@ -117,11 +110,13 @@ Each insight block has a "Show sources" expander with a per-claim table showing 
 ```bash
 git clone <repo-url> && cd sql_python_dashboard
 python -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
+pip install -r requirements-dev.txt
 .venv/bin/streamlit run dashboard/app.py
 ```
 
 The seed database ships with all 10 series, COVID-adjusted values, and 9 verified AI insights. Everything works out of the box.
+
+> **Note on requirements files:** `requirements.txt` contains only the dashboard's runtime dependencies (streamlit, pandas, plotly) with loose version pins for Streamlit Community Cloud deployment. `requirements-dev.txt` has the full pinned dependency set for local development, including the data pipeline and ARIMA modeling packages. If you migrate away from Streamlit hosting, you can merge them back into a single file.
 
 ### Full pipeline (live FRED data)
 
