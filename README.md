@@ -1,6 +1,6 @@
 # Macro Economic Dashboard: Recession Risk and AI's Labor Market Impact
 
-An end-to-end analytics pipeline that pulls macroeconomic data from the FRED API, models it in a SQLite database, analyzes it in Python, and surfaces AI-generated narrative insights — each one programmatically verified against the source data — through an interactive Streamlit dashboard.
+An end-to-end analytics pipeline that pulls macroeconomic data from the FRED API, models it in a SQLite database, analyzes it in Python, and surfaces AI-generated narrative insights, each one programmatically verified against the source data, through an interactive Streamlit dashboard.
 
 ---
 
@@ -37,7 +37,7 @@ All data comes from the [FRED API](https://fred.stlouisfed.org/) (Federal Reserv
 
 ## Key Findings
 
-1. **Information sector employment declined 7.2% per capita** over the dataset period while specialty trades grew 13.5% — a 20+ point divergence that supports the AI disruption thesis.
+1. **Information sector employment declined 7.2% per capita** over the dataset period while specialty trades grew 13.5%, a 20+ point divergence that supports the AI disruption thesis.
 2. **The yield curve inverted in 26 of the months tracked**, historically a signal that has preceded every U.S. recession since the 1970s.
 3. **Cumulative inflation reached 37.0%** across the dataset window, compressing real wages even as headline unemployment stays near 4.4%.
 4. **Electric power output rose 8.5% since ChatGPT's launch** (November 2022), consistent with surging data center demand.
@@ -56,13 +56,13 @@ FRED API → data_pull.py → db_setup.py → covid_adjustment.py → export_csv
 ```
 
 **Database:** SQLite star schema with three tables:
-- `series_metadata` (dimension) — display names, categories, units for each FRED series
-- `observations` (fact) — raw values plus ARIMA COVID-adjusted values side by side
-- `ai_insights` (cached narratives) — batch-generated prose with pre-computed claims and verification results
+- `series_metadata` (dimension): display names, categories, units for each FRED series
+- `observations` (fact): raw values plus ARIMA COVID-adjusted values side by side
+- `ai_insights` (cached narratives): batch-generated prose with pre-computed claims and verification results
 
 **Two operating modes:**
-- **Seed** (default) — ships with `data/seed.db` committed to Git. Clone and run, no API key needed.
-- **Full** — pulls live data from FRED, builds `data/full.db`. Requires a free API key.
+- **Seed** (default): ships with `data/seed.db` committed to Git. Clone and run, no API key needed.
+- **Full**: pulls live data from FRED, builds `data/full.db`. Requires a free API key.
 
 **COVID handling:** The COVID window (March 2020 through June 2021) is treated as a statistical outlier that breaks rolling-window calculations. For each series, an ARIMA model fitted on pre-COVID data forecasts a counterfactual through the disruption, with a 3-month linear taper blending back to actual values. Raw data stays in the `value` column; the adjusted series goes in `value_covid_adjusted`. All trend queries use the adjusted column except the COVID recovery chart (Q5), which intentionally shows the real shock.
 
@@ -80,9 +80,9 @@ Every AI-generated narrative in the dashboard is **batch-generated during data p
 - `verify_insights.py` independently re-queries the DB for each claim and checks it within tolerance (5% relative or 0.5 absolute for values, +/- 2 for counts, sign-match for trends)
 
 **Three-tier verification badges on the dashboard:**
-- **Verified** (green) — all claims confirmed against the database
-- **Partially Verified** (orange) — some claims confirmed (shows "X of Y")
-- **Unverified** (red) — no claims pass verification
+- **Verified** (green): all claims confirmed against the database
+- **Partially Verified** (orange): some claims confirmed (shows "X of Y")
+- **Unverified** (red): no claims pass verification
 
 Each insight block has a "Show sources" expander with a per-claim table showing the expected value, actual value, and color-coded status. The seed database ships with 9 pre-computed, fully verified insights so the demo works immediately.
 
@@ -105,7 +105,7 @@ Each insight block has a "Show sources" expander with a per-claim table showing 
 
 ## How to Run
 
-### Quick start (seed mode — no API key needed)
+### Quick start (seed mode, no API key needed)
 
 ```bash
 git clone <repo-url> && cd sql_python_dashboard
@@ -151,8 +151,8 @@ ollama serve  # keep running in a separate terminal
 
 ## What I'd Do Next
 
-- **Postgres migration** — move from SQLite to PostgreSQL for concurrent access and production-grade querying
-- **Scheduled ingestion** — automate monthly FRED pulls with a cron job or Airflow DAG so the dashboard stays current
-- **More series** — add housing starts (HOUST), initial jobless claims (ICSA), and ISM manufacturing index to widen the recession signal net
-- **Forecasting models** — extend the ARIMA work to produce forward-looking recession probability estimates
-- **Sector granularity** — break the information sector down by subsector (software, telecom, media) to isolate where AI displacement concentrates
+- **Postgres migration.** Move from SQLite to PostgreSQL for concurrent access and production-grade querying.
+- **Scheduled ingestion.** Automate monthly FRED pulls with a cron job or Airflow DAG so the dashboard stays current.
+- **More series.** Add housing starts (HOUST), initial jobless claims (ICSA), and ISM manufacturing index to widen the recession signal net.
+- **Forecasting models.** Extend the ARIMA work to produce forward-looking recession probability estimates.
+- **Sector granularity.** Break the information sector down by subsector (software, telecom, media) to isolate where AI displacement concentrates.
