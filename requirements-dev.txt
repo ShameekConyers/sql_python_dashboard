@@ -4,6 +4,7 @@ pandas==3.0.1
 pmdarima==2.1.1
 python-dateutil==2.9.0.post0
 python-dotenv==1.2.2
+scikit-learn==1.8.0
 scipy==1.17.1
 six==1.17.0
 statsmodels==0.14.6
