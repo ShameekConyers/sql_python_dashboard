@@ -518,3 +518,126 @@ class TestGeneratePredictions:
             warnings.filterwarnings("ignore")
             df = recession_model.build_feature_matrix(db)
             return recession_model.train_models(df)
+
+
+# ---------------------------------------------------------------------------
+# Scenario Grid Tests
+# ---------------------------------------------------------------------------
+
+SCENARIO_SCHEMA_SQL: str = (
+    recession_model.SQL_DIR / "05_scenario_schema.sql"
+).read_text()
+
+
+class TestGenerateScenarioGrid:
+    """Tests for generate_scenario_grid function."""
+
+    def test_populates_table(self, tmp_path: Path) -> None:
+        """Scenario grid table has rows after generation."""
+        db = self._create_test_db_with_predictions(tmp_path)
+        results = self._train_on_db(db)
+
+        recession_model.generate_predictions(db, results)
+        recession_model.generate_scenario_grid(db, results)
+
+        conn = sqlite3.connect(str(db))
+        count = conn.execute(
+            "SELECT COUNT(*) FROM scenario_grid"
+        ).fetchone()[0]
+        conn.close()
+        assert count > 0
+
+    def test_probability_range(self, tmp_path: Path) -> None:
+        """All scenario probabilities are between 0 and 1."""
+        db = self._create_test_db_with_predictions(tmp_path)
+        results = self._train_on_db(db)
+
+        recession_model.generate_predictions(db, results)
+        recession_model.generate_scenario_grid(db, results)
+
+        conn = sqlite3.connect(str(db))
+        rows = conn.execute(
+            "SELECT probability FROM scenario_grid"
+        ).fetchall()
+        conn.close()
+
+        for (prob,) in rows:
+            assert 0.0 <= prob <= 1.0, f"Probability out of range: {prob}"
+
+    def test_covers_expected_ranges(self, tmp_path: Path) -> None:
+        """Grid spans the defined min/max for each slider feature."""
+        db = self._create_test_db_with_predictions(tmp_path)
+        results = self._train_on_db(db)
+
+        recession_model.generate_predictions(db, results)
+        recession_model.generate_scenario_grid(db, results)
+
+        conn = sqlite3.connect(str(db))
+        df = pd.read_sql_query("SELECT * FROM scenario_grid", conn)
+        conn.close()
+
+        for feat, spec in recession_model.SCENARIO_GRID_RANGES.items():
+            assert df[feat].min() == pytest.approx(spec["min"], abs=0.01)
+            assert df[feat].max() == pytest.approx(spec["max"], abs=0.01)
+
+    def test_idempotent(self, tmp_path: Path) -> None:
+        """Running generate_scenario_grid twice replaces, not appends."""
+        db = self._create_test_db_with_predictions(tmp_path)
+        results = self._train_on_db(db)
+
+        recession_model.generate_predictions(db, results)
+        recession_model.generate_scenario_grid(db, results)
+
+        conn = sqlite3.connect(str(db))
+        count1 = conn.execute(
+            "SELECT COUNT(*) FROM scenario_grid"
+        ).fetchone()[0]
+        conn.close()
+
+        recession_model.generate_scenario_grid(db, results)
+
+        conn = sqlite3.connect(str(db))
+        count2 = conn.execute(
+            "SELECT COUNT(*) FROM scenario_grid"
+        ).fetchone()[0]
+        conn.close()
+
+        assert count1 == count2, "Row count changed on second run"
+
+    # --- Helpers ---
+
+    @staticmethod
+    def _create_test_db_with_predictions(tmp_path: Path) -> Path:
+        """Create a test DB with schema, data, and prediction table.
+
+        Args:
+            tmp_path: Pytest temporary directory.
+
+        Returns:
+            Path to the test database.
+        """
+        db = tmp_path / "test_scenario.db"
+        conn = sqlite3.connect(str(db))
+        conn.executescript(SCHEMA_SQL)
+        conn.executescript(PREDICTION_SCHEMA_SQL)
+        conn.executescript(SCENARIO_SCHEMA_SQL)
+        _populate_synthetic_db(conn)
+        conn.close()
+        return db
+
+    @staticmethod
+    def _train_on_db(db: Path) -> dict:
+        """Build features and train models on a test database.
+
+        Args:
+            db: Path to a populated test database.
+
+        Returns:
+            Model training results.
+        """
+        import warnings
+
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore")
+            df = recession_model.build_feature_matrix(db)
+            return recession_model.train_models(df)

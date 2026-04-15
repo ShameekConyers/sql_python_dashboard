@@ -11,6 +11,7 @@ import json
 import sqlite3
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
@@ -270,12 +271,15 @@ def get_recession_data(date_min: str, date_max: str, full: bool = False) -> pd.D
     )
 
 
-def style_figure(fig: go.Figure, title: str = "") -> go.Figure:
+def style_figure(
+    fig: go.Figure, title: str = "", height: int = 450
+) -> go.Figure:
     """Apply consistent styling to a Plotly figure.
 
     Args:
         fig: The Plotly figure to style.
         title: Optional chart title.
+        height: Chart height in pixels.
 
     Returns:
         The styled figure.
@@ -284,6 +288,7 @@ def style_figure(fig: go.Figure, title: str = "") -> go.Figure:
         title=dict(text=title, y=0.98, yanchor="top"),
         template="plotly_white",
         hovermode="x unified",
+        height=height,
         margin=dict(l=50, r=20, t=80, b=30),
         legend=dict(orientation="h", yanchor="top", y=-0.15, xanchor="center", x=0.5),
         xaxis=dict(tickformat="%b %Y"),
@@ -304,6 +309,8 @@ def render_ai_insight_block(metric_key: str, insight_type: str, full: bool = Fal
     """
     insight = get_ai_insight(metric_key, insight_type, full)
     if insight is None:
+        with st.expander("AI Insight", expanded=False):
+            st.caption("No AI-generated insight available for this section yet.")
         return
 
     # Determine three-tier verification status from individual claims
@@ -360,6 +367,193 @@ def render_ai_insight_block(metric_key: str, insight_type: str, full: bool = Fal
                     _color_status, subset=["Status"]
                 )
                 st.dataframe(styled, use_container_width=True, hide_index=True)
+
+
+# ---------------------------------------------------------------------------
+# Recession Risk data layer
+# ---------------------------------------------------------------------------
+
+FEATURE_LABELS: dict[str, str] = {
+    "yield_spread": "Yield Curve Spread",
+    "yield_spread_3m_avg": "Yield Spread (3-mo Avg)",
+    "yield_inverted_months": "Months Inverted (trailing 6)",
+    "unrate": "Unemployment Rate",
+    "unrate_12m_change": "Unemployment 12-mo Change",
+    "u6_u3_gap": "U6-U3 Gap",
+    "gdp_growth_annualized": "GDP Growth (Annualized)",
+    "cpi_yoy": "CPI Inflation (YoY)",
+    "info_trades_divergence": "Info vs Trades Divergence",
+    "info_employment_yoy": "Info Employment YoY Growth",
+    "power_output_yoy": "Power Output YoY Growth",
+}
+
+# Heuristics for recession signal coloring (red = recession-like)
+RECESSION_SIGNAL_RULES: dict[str, str] = {
+    "yield_spread": "negative",        # < 0 means inverted curve
+    "yield_inverted_months": "positive",  # > 0 means months inverted
+    "unrate_12m_change": "positive",    # > 0 means rising unemployment
+    "gdp_growth_annualized": "negative",  # < 0 means contracting
+    "info_employment_yoy": "negative",  # < 0 means info sector shrinking
+}
+# u6_u3_gap uses median comparison, handled separately
+
+
+def _table_exists(table_name: str, full: bool = False) -> bool:
+    """Check whether a table exists in the database.
+
+    Args:
+        table_name: Name of the table to check.
+        full: Whether to use full.db instead of seed.db.
+
+    Returns:
+        True if the table exists.
+    """
+    conn = get_connection(full)
+    try:
+        result = conn.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?",
+            (table_name,),
+        ).fetchone()
+        return result[0] > 0
+    finally:
+        conn.close()
+
+
+@st.cache_data(ttl=300)
+def query_predictions(
+    date_min: str, date_max: str, full: bool = False
+) -> pd.DataFrame:
+    """Query recession predictions for the timeline chart.
+
+    Args:
+        date_min: Start date filter (ISO string).
+        date_max: End date filter (ISO string).
+        full: Whether to use full.db instead of seed.db.
+
+    Returns:
+        DataFrame with date, probability, prediction, actual, model_name.
+    """
+    return run_query(
+        f"""
+        SELECT date, probability, prediction, actual, model_name
+        FROM recession_predictions
+        WHERE date BETWEEN '{date_min}' AND '{date_max}'
+        ORDER BY date
+        """,
+        full,
+    )
+
+
+@st.cache_data(ttl=300)
+def get_latest_prediction(full: bool = False) -> dict | None:
+    """Get the most recent prediction row with parsed features.
+
+    Args:
+        full: Whether to use full.db instead of seed.db.
+
+    Returns:
+        Dict with date, probability, prediction, model_name, features
+        (parsed dict), or None if no predictions exist.
+    """
+    df = run_query(
+        """
+        SELECT date, probability, prediction, model_name, features_json
+        FROM recession_predictions
+        ORDER BY date DESC
+        LIMIT 1
+        """,
+        full,
+    )
+    if df.empty:
+        return None
+    row = df.iloc[0]
+    return {
+        "date": row["date"],
+        "probability": row["probability"],
+        "prediction": row["prediction"],
+        "model_name": row["model_name"],
+        "features": json.loads(row["features_json"]),
+    }
+
+
+@st.cache_data(ttl=300)
+def query_scenario_grid(full: bool = False) -> pd.DataFrame:
+    """Load the entire scenario_grid table for nearest-neighbor lookup.
+
+    Args:
+        full: Whether to use full.db instead of seed.db.
+
+    Returns:
+        DataFrame with yield_spread, unrate, gdp_growth_annualized,
+        cpi_yoy, probability, model_name columns.
+    """
+    return run_query(
+        """
+        SELECT yield_spread, unrate, gdp_growth_annualized,
+               cpi_yoy, probability, model_name
+        FROM scenario_grid
+        """,
+        full,
+    )
+
+
+def get_feature_signal_color(feature: str, value: float, u6_u3_median: float = 3.5) -> str:
+    """Determine recession signal color for a feature value.
+
+    Args:
+        feature: Feature column name.
+        value: Current feature value.
+        u6_u3_median: Historical median for u6_u3_gap comparison.
+
+    Returns:
+        Color string: red (recession-like), green (healthy), or gray (neutral).
+    """
+    if feature == "u6_u3_gap":
+        return "red" if value > u6_u3_median else "green"
+
+    rule = RECESSION_SIGNAL_RULES.get(feature)
+    if rule == "negative":
+        return "red" if value < 0 else "green"
+    if rule == "positive":
+        return "red" if value > 0 else "green"
+    return "gray"
+
+
+def find_nearest_scenario(
+    grid_df: pd.DataFrame,
+    yield_spread: float,
+    unrate: float,
+    gdp_growth: float,
+    cpi_yoy: float,
+) -> pd.Series:
+    """Find the nearest scenario in the grid using normalized Euclidean distance.
+
+    Args:
+        grid_df: Scenario grid DataFrame.
+        yield_spread: Slider value for yield spread.
+        unrate: Slider value for unemployment rate.
+        gdp_growth: Slider value for GDP growth.
+        cpi_yoy: Slider value for CPI YoY.
+
+    Returns:
+        The nearest row from the grid as a pandas Series.
+    """
+    slider_cols = ["yield_spread", "unrate", "gdp_growth_annualized", "cpi_yoy"]
+    slider_vals = np.array([yield_spread, unrate, gdp_growth, cpi_yoy])
+
+    # Min-max normalize for scale-invariant distance
+    grid_vals = grid_df[slider_cols].values
+    col_min = grid_vals.min(axis=0)
+    col_max = grid_vals.max(axis=0)
+    col_range = col_max - col_min
+    col_range[col_range == 0] = 1.0  # avoid division by zero
+
+    grid_norm = (grid_vals - col_min) / col_range
+    slider_norm = (slider_vals - col_min) / col_range
+
+    distances = np.sqrt(((grid_norm - slider_norm) ** 2).sum(axis=1))
+    nearest_idx = distances.argmin()
+    return grid_df.iloc[nearest_idx]
 
 
 # ---------------------------------------------------------------------------
@@ -830,6 +1024,58 @@ def get_sparkline_data(
     ).sort_values("date")
 
 
+@st.cache_data(ttl=300)
+def get_gdp_growth_sparkline(months: int = 24, full: bool = False) -> pd.DataFrame:
+    """Get recent GDP annualized growth rates for a sparkline.
+
+    Args:
+        months: Number of recent quarters to include.
+        full: Whether to use full.db.
+
+    Returns:
+        DataFrame with date and value columns (annualized growth %).
+    """
+    df = run_query(
+        """
+        SELECT date,
+            ROUND((value_covid_adjusted / LAG(value_covid_adjusted)
+                OVER (ORDER BY date) - 1) * 400, 2) AS value
+        FROM observations
+        WHERE series_id = 'GDPC1'
+        ORDER BY date
+        """,
+        full,
+    )
+    df = df.dropna(subset=["value"])
+    return df.tail(months)
+
+
+@st.cache_data(ttl=300)
+def get_cpi_yoy_sparkline(months: int = 24, full: bool = False) -> pd.DataFrame:
+    """Get recent CPI year-over-year inflation rates for a sparkline.
+
+    Args:
+        months: Number of recent months to include.
+        full: Whether to use full.db.
+
+    Returns:
+        DataFrame with date and value columns (YoY %).
+    """
+    df = run_query(
+        """
+        SELECT date,
+            ROUND((value_covid_adjusted / LAG(value_covid_adjusted, 12)
+                OVER (ORDER BY date) - 1) * 100, 2) AS value
+        FROM observations
+        WHERE series_id = 'CPIAUCSL'
+        ORDER BY date
+        """,
+        full,
+    )
+    df = df.dropna(subset=["value"])
+    return df.tail(months)
+
+
 # ---------------------------------------------------------------------------
 # Page config
 # ---------------------------------------------------------------------------
@@ -890,6 +1136,19 @@ with st.sidebar:
     st.caption(f"Data range: {date_min_db} to {date_max_db}")
     st.caption(f"Observations: {run_query('SELECT COUNT(*) AS n FROM observations', use_full)['n'].iloc[0]:,}")
 
+    # Prediction model info
+    if _table_exists("recession_predictions", use_full):
+        pred_meta = run_query(
+            """
+            SELECT model_name, MAX(generated_at) AS last_gen
+            FROM recession_predictions
+            """,
+            use_full,
+        )
+        if not pred_meta.empty and pred_meta["last_gen"].iloc[0]:
+            st.caption(f"Predictions: {pred_meta['model_name'].iloc[0]}")
+            st.caption(f"Model run: {pred_meta['last_gen'].iloc[0][:10]}")
+
 
 # ---------------------------------------------------------------------------
 # Header
@@ -908,6 +1167,8 @@ last_updated = run_query(
 if last_updated:
     st.caption(f"Data last updated: {last_updated}")
 
+render_ai_insight_block("dashboard_intro", "trend", use_full)
+
 st.divider()
 
 
@@ -917,53 +1178,93 @@ st.divider()
 
 st.header("Overview")
 
-# KPI cards
-kpi_cols = st.columns(5)
-
+# KPI data
 unrate_val, unrate_delta, unrate_date = get_latest_metric("UNRATE", use_full)
-with kpi_cols[0]:
-    st.metric("Unemployment (U3)", f"{unrate_val:.1f}%", f"{unrate_delta:+.1f}pp MoM")
-
 u6_val, u6_delta, u6_date = get_latest_metric("U6RATE", use_full)
-with kpi_cols[1]:
-    st.metric("Underemployment (U6)", f"{u6_val:.1f}%", f"{u6_delta:+.1f}pp MoM")
-
 gdp_growth, gdp_date = get_gdp_latest_growth(use_full)
-with kpi_cols[2]:
-    st.metric("GDP Growth (Ann.)", f"{gdp_growth:+.1f}%", gdp_date[:7] if gdp_date else "")
-
 t10y2y_val, t10y2y_delta, t10y2y_date = get_latest_metric("T10Y2Y", use_full)
 inverted_label = "INVERTED" if t10y2y_val < 0 else "Normal"
-with kpi_cols[3]:
-    st.metric("Yield Spread (10Y-2Y)", f"{t10y2y_val:.2f}%", inverted_label)
-
 cpi_yoy, cpi_date = get_cpi_yoy_latest(use_full)
-with kpi_cols[4]:
-    st.metric("CPI Inflation (YoY)", f"{cpi_yoy:.1f}%", cpi_date[:7] if cpi_date else "")
 
-# Sparklines
-spark_cols = st.columns(5)
-spark_configs: list[tuple[str, str, str]] = [
-    ("UNRATE", "Unemployment", COLORS["unemployment"]),
-    ("U6RATE", "U6 Rate", COLORS["u6"]),
-    ("GDPC1", "Real GDP", COLORS["gdp"]),
-    ("T10Y2Y", "Yield Spread", COLORS["yield"]),
-    ("CPIAUCSL", "CPI Level", COLORS["cpi"]),
-]
-for col, (sid, label, color) in zip(spark_cols, spark_configs):
-    spark_df = get_sparkline_data(sid, 24, use_full)
+# Sparkline helper
+spark_configs: dict[str, tuple[str, str]] = {
+    "UNRATE": ("Unemployment", COLORS["unemployment"]),
+    "U6RATE": ("U6 Rate", COLORS["u6"]),
+    "GDPC1": ("Real GDP", COLORS["gdp"]),
+    "T10Y2Y": ("Yield Spread", COLORS["yield"]),
+    "CPIAUCSL": ("CPI Level", COLORS["cpi"]),
+}
+
+
+def _render_sparkline(series_id: str) -> None:
+    """Render a sparkline mini-chart for the given series.
+
+    Uses derived percentage data for GDP (annualized growth) and CPI
+    (YoY inflation) so the sparkline matches the KPI card metric.
+
+    Args:
+        series_id: FRED series identifier.
+    """
+    label, color = spark_configs[series_id]
+
+    # Use derived % series for GDP and CPI to match KPI card values
+    if series_id == "GDPC1":
+        spark_df = get_gdp_growth_sparkline(24, use_full)
+        hover_fmt = "%{x|%b %Y}: %{y:+.1f}%<extra></extra>"
+    elif series_id == "CPIAUCSL":
+        spark_df = get_cpi_yoy_sparkline(24, use_full)
+        hover_fmt = "%{x|%b %Y}: %{y:.1f}%<extra></extra>"
+    else:
+        spark_df = get_sparkline_data(series_id, 24, use_full)
+        hover_fmt = "%{x|%b %Y}: %{y:.2f}<extra></extra>"
+
     fig = go.Figure(go.Scatter(
         x=spark_df["date"], y=spark_df["value"],
         mode="lines", line=dict(color=color, width=2),
-        hovertemplate="%{x|%b %Y}: %{y:.2f}<extra></extra>",
+        hovertemplate=hover_fmt,
     ))
+    show_zero = series_id in ("GDPC1", "T10Y2Y", "CPIAUCSL")
+    if show_zero:
+        fig.add_hline(y=0, line_color="#333333", line_width=1, opacity=0.8)
+        fig.add_annotation(
+            x=0, xref="paper", xanchor="right",
+            y=0, yref="y",
+            text="<b>0</b>", showarrow=False,
+            font=dict(size=11, color="#333333"),
+            xshift=-4,
+        )
     fig.update_layout(
-        height=100, margin=dict(l=0, r=0, t=0, b=0),
-        xaxis=dict(visible=False), yaxis=dict(visible=False),
+        height=100,
+        margin=dict(l=20 if show_zero else 0, r=0, t=0, b=0),
+        xaxis=dict(visible=False),
+        yaxis=dict(visible=False),
         showlegend=False,
     )
-    with col:
-        st.plotly_chart(fig, use_container_width=True, key=f"spark_{sid}")
+    st.plotly_chart(fig, use_container_width=True, key=f"spark_{series_id}")
+
+
+# Row 1: GDP, Yield Spread, CPI
+row1 = st.columns(3)
+with row1[0]:
+    st.metric("GDP Growth (Ann.)", f"{gdp_growth:+.1f}%", gdp_date[:7] if gdp_date else "")
+    _render_sparkline("GDPC1")
+with row1[1]:
+    st.metric("Yield Spread (10Y-2Y)", f"{t10y2y_val:.2f}%", inverted_label)
+    _render_sparkline("T10Y2Y")
+with row1[2]:
+    st.metric("CPI Inflation (YoY)", f"{cpi_yoy:.1f}%", cpi_date[:7] if cpi_date else "")
+    _render_sparkline("CPIAUCSL")
+
+# Row 2: Employment metrics
+row2 = st.columns(3)
+with row2[0]:
+    st.metric("Unemployment (U3)", f"{unrate_val:.1f}%", f"{unrate_delta:+.1f}pp MoM")
+    _render_sparkline("UNRATE")
+with row2[1]:
+    st.metric("Underemployment (U6)", f"{u6_val:.1f}%", f"{u6_delta:+.1f}pp MoM")
+    _render_sparkline("U6RATE")
+
+render_ai_insight_block("overview", "trend", use_full)
 
 st.divider()
 
@@ -974,8 +1275,11 @@ st.divider()
 
 st.header("Exploration")
 
-tab_recession, tab_labor, tab_broader = st.tabs([
-    "Recession Signals", "AI Labor Impact", "Broader Signals"
+tab_recession, tab_labor, tab_broader, tab_predictions = st.tabs([
+    "Recession Signals",
+    "AI Labor Impact",
+    "Broader Signals",
+    "Recession Risk",
 ])
 
 # --- Tab 1: Recession Signals ---
@@ -1263,6 +1567,322 @@ with tab_broader:
                 st.plotly_chart(fig_q7, use_container_width=True, key="q7")
                 render_ai_insight_block("IPG2211S_USINFO", "correlation", use_full)
 
+
+# --- Tab 4: Recession Risk ---
+with tab_predictions:
+    has_predictions = _table_exists("recession_predictions", use_full)
+    has_scenarios = _table_exists("scenario_grid", use_full)
+
+    if not has_predictions:
+        st.info("Run recession_model.py to generate predictions.")
+    else:
+        # --- 1a: Recession Risk Score Timeline ---
+        st.subheader("Recession Risk Score Timeline")
+        df_pred = query_predictions(date_min, date_max, use_full)
+
+        if not df_pred.empty:
+            recession_data_pred = get_recession_data(date_min, date_max, use_full)
+
+            fig_timeline = go.Figure()
+
+            # Recession shading
+            add_recession_shading(fig_timeline, recession_data_pred)
+
+            # Threshold line at 0.5
+            fig_timeline.add_hline(
+                y=0.5, line_dash="dash", line_color="gray", opacity=0.5,
+                annotation_text="Classification Threshold",
+                annotation_position="bottom right",
+            )
+
+            # Color-code markers by threshold
+            marker_colors = [
+                "green" if p < 0.3 else ("goldenrod" if p < 0.6 else "red")
+                for p in df_pred["probability"]
+            ]
+
+            # Split into evaluated vs forward predictions. Forward
+            # predictions are trailing months where actual=0 but the
+            # model's 12-month target window extends beyond available data.
+            # Walk backward from end to find the last recession month; all
+            # months after that are treated as forward predictions.
+            forward_start = len(df_pred)
+            for i in range(len(df_pred) - 1, -1, -1):
+                if df_pred["actual"].iloc[i] == 1:
+                    forward_start = i + 1
+                    break
+
+            df_evaluated = df_pred.iloc[:forward_start]
+            df_forward = df_pred.iloc[max(0, forward_start - 1):]
+
+            # Evaluated predictions — solid line with colored markers
+            if not df_evaluated.empty:
+                fig_timeline.add_trace(go.Scatter(
+                    x=df_evaluated["date"],
+                    y=df_evaluated["probability"],
+                    mode="lines+markers",
+                    name="Recession Risk Score",
+                    line=dict(color="steelblue", width=2),
+                    marker=dict(
+                        color=marker_colors[:forward_start],
+                        size=5,
+                    ),
+                    hovertemplate="%{x|%b %Y}: %{y:.3f}<extra>Risk Score</extra>",
+                ))
+
+            # Forward predictions — dashed line (genuine forecasts)
+            if len(df_forward) > 1:
+                fig_timeline.add_trace(go.Scatter(
+                    x=df_forward["date"],
+                    y=df_forward["probability"],
+                    mode="lines+markers",
+                    name="Forward Forecast",
+                    line=dict(color="steelblue", width=2, dash="dash"),
+                    marker=dict(
+                        color=marker_colors[max(0, forward_start - 1):],
+                        size=5,
+                    ),
+                    hovertemplate="%{x|%b %Y}: %{y:.3f}<extra>Forecast</extra>",
+                ))
+
+            # ChatGPT launch marker
+            add_annotated_vline(
+                fig_timeline, CHATGPT_LAUNCH, text="ChatGPT Launch"
+            )
+
+            fig_timeline.update_yaxes(
+                title_text="Recession Risk Score", range=[0, 1]
+            )
+            style_figure(
+                fig_timeline,
+                "Recession Risk Score Over Time",
+            )
+            st.plotly_chart(fig_timeline, use_container_width=True, key="pred_timeline")
+
+            # Model caption
+            model_name = df_pred["model_name"].iloc[0]
+            st.caption(
+                f"Model: {model_name.replace('_', ' ').title()} | "
+                "Scores indicate relative recession risk based on 11 "
+                "macroeconomic features. Higher values mean more features "
+                "align with historical pre-recession patterns. These are "
+                "model outputs, not calibrated probabilities."
+            )
+            st.caption(
+                "Recent predictions extend beyond the model's 12-month "
+                "forward window. These represent genuine forecasts, not "
+                "evaluated test results."
+            )
+            render_ai_insight_block("recession_risk", "trend", use_full)
+
+        # --- 1b: Feature Contribution Snapshot ---
+        st.subheader("Feature Contribution Snapshot")
+        latest_pred = get_latest_prediction(use_full)
+
+        if latest_pred is not None:
+            features = latest_pred["features"]
+            feature_names = list(features.keys())
+            feature_values = [features[f] for f in feature_names]
+            display_labels = [
+                FEATURE_LABELS.get(f, f) for f in feature_names
+            ]
+
+            # Compute u6_u3_gap median from predictions for heuristic
+            all_preds_for_median = run_query(
+                "SELECT features_json FROM recession_predictions", use_full
+            )
+            u6_u3_values = []
+            for fj in all_preds_for_median["features_json"]:
+                parsed = json.loads(fj)
+                if "u6_u3_gap" in parsed:
+                    u6_u3_values.append(parsed["u6_u3_gap"])
+            u6_u3_median = float(np.median(u6_u3_values)) if u6_u3_values else 3.5
+
+            bar_colors = [
+                get_feature_signal_color(f, v, u6_u3_median)
+                for f, v in zip(feature_names, feature_values)
+            ]
+
+            fig_features = go.Figure(go.Bar(
+                y=display_labels,
+                x=feature_values,
+                orientation="h",
+                marker_color=bar_colors,
+                text=[f"{v:.3f}" for v in feature_values],
+                textposition="outside",
+                hovertemplate="%{y}: %{x:.4f}<extra></extra>",
+            ))
+            fig_features.update_layout(
+                template="plotly_white",
+                height=450,
+                margin=dict(l=200, r=80, t=40, b=30),
+                xaxis_title="Feature Value",
+                yaxis=dict(autorange="reversed"),
+            )
+            st.plotly_chart(fig_features, use_container_width=True, key="feature_snapshot")
+
+            st.caption(
+                f"Feature values as of {latest_pred['date']} | "
+                f"Risk score: {latest_pred['probability']:.3f} | "
+                "Red = recession-like signal, Green = healthy, Gray = neutral"
+            )
+            render_ai_insight_block("feature_snapshot", "trend", use_full)
+
+        # --- 1c: What If Scenario Explorer ---
+        st.subheader("What If Scenario Explorer")
+
+        if not has_scenarios:
+            st.info(
+                "Run recession_model.py to generate the scenario grid."
+            )
+        else:
+            grid_df = query_scenario_grid(use_full)
+
+            if grid_df.empty:
+                st.warning("Scenario grid is empty.")
+            else:
+                # Get latest feature values for slider defaults and fixed display
+                if latest_pred is not None:
+                    default_features = latest_pred["features"]
+                else:
+                    default_features = {
+                        "yield_spread": 0.5,
+                        "unrate": 4.0,
+                        "gdp_growth_annualized": 2.0,
+                        "cpi_yoy": 3.0,
+                    }
+
+                slider_col1, slider_col2 = st.columns(2)
+
+                with slider_col1:
+                    s_yield = st.slider(
+                        "Yield Curve Spread",
+                        min_value=-1.5,
+                        max_value=3.0,
+                        value=float(
+                            np.clip(default_features.get("yield_spread", 0.5), -1.5, 3.0)
+                        ),
+                        step=0.25,
+                        key="slider_yield",
+                    )
+                    s_unrate = st.slider(
+                        "Unemployment Rate",
+                        min_value=2.5,
+                        max_value=8.0,
+                        value=float(
+                            np.clip(default_features.get("unrate", 4.0), 2.5, 8.0)
+                        ),
+                        step=0.25,
+                        key="slider_unrate",
+                    )
+
+                with slider_col2:
+                    s_gdp = st.slider(
+                        "GDP Growth (Annualized)",
+                        min_value=-6.0,
+                        max_value=10.0,
+                        value=float(
+                            np.clip(
+                                default_features.get("gdp_growth_annualized", 2.0),
+                                -6.0, 10.0,
+                            )
+                        ),
+                        step=0.5,
+                        key="slider_gdp",
+                    )
+                    s_cpi = st.slider(
+                        "CPI Inflation (YoY)",
+                        min_value=0.0,
+                        max_value=12.0,
+                        value=float(
+                            np.clip(default_features.get("cpi_yoy", 3.0), 0.0, 12.0)
+                        ),
+                        step=0.5,
+                        key="slider_cpi",
+                    )
+
+                # Nearest-neighbor lookup
+                nearest = find_nearest_scenario(
+                    grid_df, s_yield, s_unrate, s_gdp, s_cpi
+                )
+                scenario_prob = float(nearest["probability"])
+
+                # Display result
+                result_col1, result_col2 = st.columns([1, 2])
+
+                with result_col1:
+                    if scenario_prob < 0.3:
+                        risk_label = "Low Risk"
+                    elif scenario_prob < 0.6:
+                        risk_label = "Moderate Risk"
+                    else:
+                        risk_label = "High Risk"
+                    st.metric(
+                        "Recession Risk Score",
+                        f"{scenario_prob:.3f}",
+                        risk_label,
+                    )
+
+                with result_col2:
+                    # Color bar gauge
+                    gauge_color = (
+                        "green" if scenario_prob < 0.3
+                        else ("goldenrod" if scenario_prob < 0.6 else "red")
+                    )
+                    fig_gauge = go.Figure(go.Indicator(
+                        mode="gauge+number",
+                        value=scenario_prob,
+                        number=dict(suffix="", valueformat=".3f"),
+                        gauge=dict(
+                            axis=dict(range=[0, 1]),
+                            bar=dict(color=gauge_color),
+                            steps=[
+                                dict(range=[0, 0.3], color="rgba(0,200,0,0.1)"),
+                                dict(range=[0.3, 0.6], color="rgba(255,200,0,0.1)"),
+                                dict(range=[0.6, 1], color="rgba(255,0,0,0.1)"),
+                            ],
+                            threshold=dict(
+                                line=dict(color="black", width=2),
+                                thickness=0.75,
+                                value=0.5,
+                            ),
+                        ),
+                    ))
+                    fig_gauge.update_layout(
+                        height=200,
+                        margin=dict(l=20, r=20, t=30, b=10),
+                    )
+                    st.plotly_chart(fig_gauge, use_container_width=True, key="gauge")
+
+                st.caption(
+                    "Based on the closest pre-computed scenario. Other features "
+                    "held at their most recent observed values."
+                )
+
+                # Show fixed features as read-only context
+                if latest_pred is not None:
+                    slider_keys = {
+                        "yield_spread", "unrate",
+                        "gdp_growth_annualized", "cpi_yoy",
+                    }
+                    fixed = {
+                        FEATURE_LABELS.get(k, k): f"{v:.3f}"
+                        for k, v in latest_pred["features"].items()
+                        if k not in slider_keys
+                    }
+                    with st.expander("Fixed features (held at latest values)"):
+                        fixed_df = pd.DataFrame(
+                            list(fixed.items()),
+                            columns=["Feature", "Value"],
+                        )
+                        st.dataframe(
+                            fixed_df,
+                            use_container_width=True,
+                            hide_index=True,
+                        )
+
+                render_ai_insight_block("scenario_explorer", "comparison", use_full)
+
 st.divider()
 
 
@@ -1305,6 +1925,7 @@ with deep_col1:
         fig_deep1.update_yaxes(title_text="Per-Capita Index")
         style_figure(fig_deep1, "Info vs Trades (Per-Capita Indexed)")
         st.plotly_chart(fig_deep1, use_container_width=True, key="deep_q2")
+        render_ai_insight_block("deep_divergence", "comparison", use_full)
 
 with deep_col2:
     st.subheader("Energy Paradox")
@@ -1323,6 +1944,9 @@ with deep_col2:
         fig_deep2.update_yaxes(title_text="Index (start=100)")
         style_figure(fig_deep2, "Power Output vs Info Employment")
         st.plotly_chart(fig_deep2, use_container_width=True, key="deep_q7")
+        render_ai_insight_block("deep_energy", "correlation", use_full)
+
+render_ai_insight_block("deep_synthesis_charts", "comparison", use_full)
 
 # Key findings
 st.subheader("Key Findings")

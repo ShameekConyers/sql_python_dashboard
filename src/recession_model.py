@@ -13,6 +13,7 @@ Pipeline position:
 from __future__ import annotations
 
 import argparse
+import itertools
 import json
 import logging
 import sqlite3
@@ -511,6 +512,154 @@ def generate_predictions(db_path: Path, model_results: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Scenario grid
+# ---------------------------------------------------------------------------
+
+# Coarser grid ranges for the 4 slider features (keeps total under ~12k rows)
+SCENARIO_GRID_RANGES: dict[str, dict[str, float]] = {
+    "yield_spread": {"min": -1.5, "max": 3.0, "step": 0.5},
+    "unrate": {"min": 3.0, "max": 7.0, "step": 0.5},
+    "gdp_growth_annualized": {"min": -4.0, "max": 8.0, "step": 1.0},
+    "cpi_yoy": {"min": 1.0, "max": 10.0, "step": 1.0},
+}
+
+SLIDER_FEATURES: list[str] = list(SCENARIO_GRID_RANGES.keys())
+
+
+def _ensure_scenario_table(conn: sqlite3.Connection) -> None:
+    """Create the ``scenario_grid`` table if it does not exist.
+
+    Args:
+        conn: Open SQLite connection.
+    """
+    schema_sql = (SQL_DIR / "05_scenario_schema.sql").read_text()
+    conn.executescript(schema_sql)
+
+
+def generate_scenario_grid(db_path: Path, model_results: dict) -> None:
+    """Generate a pre-computed scenario grid for the What If explorer.
+
+    Varies 4 slider features across defined ranges while holding the
+    remaining 7 features at their latest observed values. Stores all
+    scenario probabilities in the ``scenario_grid`` table.
+
+    Args:
+        db_path: Path to the SQLite database.
+        model_results: Output from ``train_models``, containing the
+            trained models and scalers.
+    """
+    # Pick best model (same logic as generate_predictions)
+    lr_auc = model_results["logistic_regression"]["metrics"]["auc_roc"]
+    rf_auc = model_results["random_forest"]["metrics"]["auc_roc"]
+
+    if np.isnan(lr_auc) and np.isnan(rf_auc):
+        best_name = "logistic_regression"
+    elif np.isnan(lr_auc):
+        best_name = "random_forest"
+    elif np.isnan(rf_auc):
+        best_name = "logistic_regression"
+    elif rf_auc > lr_auc:
+        best_name = "random_forest"
+    else:
+        best_name = "logistic_regression"
+
+    best = model_results[best_name]
+    model = best["model"]
+    scaler = best["scaler"]
+
+    # Get latest feature values from the most recent prediction row
+    conn = sqlite3.connect(str(db_path))
+    try:
+        latest_row = pd.read_sql_query(
+            "SELECT features_json FROM recession_predictions "
+            "ORDER BY date DESC LIMIT 1",
+            conn,
+        )
+    finally:
+        conn.close()
+
+    if latest_row.empty:
+        logger.warning("No predictions found. Run generate_predictions() first.")
+        return
+
+    latest_features: dict[str, float] = json.loads(
+        latest_row["features_json"].iloc[0]
+    )
+
+    # Build grid combinations for 4 slider features
+    grid_axes: list[list[float]] = []
+    for feat in SLIDER_FEATURES:
+        r = SCENARIO_GRID_RANGES[feat]
+        values = np.arange(r["min"], r["max"] + r["step"] / 2, r["step"])
+        grid_axes.append(values.tolist())
+
+    combinations = list(itertools.product(*grid_axes))
+    logger.info("Scenario grid: %d combinations.", len(combinations))
+
+    # Fixed features (the 7 not adjustable via sliders)
+    fixed_features: list[str] = [
+        f for f in FEATURE_COLUMNS if f not in SLIDER_FEATURES
+    ]
+
+    # Build feature matrix for all grid points
+    rows_data: list[list[float]] = []
+    for combo in combinations:
+        row = []
+        slider_map = dict(zip(SLIDER_FEATURES, combo))
+        for feat in FEATURE_COLUMNS:
+            if feat in slider_map:
+                row.append(slider_map[feat])
+            else:
+                row.append(latest_features[feat])
+        rows_data.append(row)
+
+    X_grid = np.array(rows_data)
+
+    if scaler is not None:
+        X_grid_transformed = scaler.transform(X_grid)
+    else:
+        X_grid_transformed = X_grid
+
+    probabilities = model.predict_proba(X_grid_transformed)[:, 1]
+
+    generated_at = datetime.now(timezone.utc).isoformat()
+
+    # Write to database atomically
+    conn = sqlite3.connect(str(db_path))
+    try:
+        _ensure_scenario_table(conn)
+
+        conn.execute("DELETE FROM scenario_grid")
+        insert_rows: list[tuple] = []
+        for i, combo in enumerate(combinations):
+            insert_rows.append((
+                combo[0],  # yield_spread
+                combo[1],  # unrate
+                combo[2],  # gdp_growth_annualized
+                combo[3],  # cpi_yoy
+                float(probabilities[i]),
+                best_name,
+                generated_at,
+            ))
+
+        conn.executemany(
+            """
+            INSERT INTO scenario_grid
+                (yield_spread, unrate, gdp_growth_annualized, cpi_yoy,
+                 probability, model_name, generated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            insert_rows,
+        )
+        conn.commit()
+        logger.info(
+            "Wrote %d rows to scenario_grid.", len(insert_rows)
+        )
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -577,6 +726,9 @@ def main() -> None:
 
     logger.info("Generating predictions ...")
     generate_predictions(db, results)
+
+    logger.info("Generating scenario grid ...")
+    generate_scenario_grid(db, results)
     logger.info("Done.")
 
 
