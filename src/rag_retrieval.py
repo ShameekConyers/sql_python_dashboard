@@ -18,6 +18,14 @@ PROJECT_ROOT: Path = Path(__file__).resolve().parent.parent
 CHROMA_DIR: Path = PROJECT_ROOT / "data" / ".chroma"
 COLLECTION_NAME: str = "fred_references"
 
+FRED_DOC_TYPES: tuple[str, ...] = (
+    "series_notes",
+    "release_info",
+    "category_path",
+)
+"""Non-scholarly doc_type values. Used to build the scholarly-only where
+filter without enumerating scholarly slugs."""
+
 logger: logging.Logger = logging.getLogger(__name__)
 
 _COLLECTION_CACHE: dict[str, Any] = {}
@@ -157,6 +165,7 @@ def retrieve(
     *,
     k: int = 5,
     series_hint: str | None = None,
+    min_scholarly: int = 0,
 ) -> list[RetrievedChunk]:
     """Return the top-k most relevant reference chunks for ``query``.
 
@@ -164,11 +173,17 @@ def retrieve(
     metadata ``series_id`` matches. If that strict filter returns nothing,
     fall back to an unfiltered query so the caller still gets some context.
 
+    When ``min_scholarly > 0`` the result is guaranteed to contain at least
+    that many scholarly chunks (``doc_type`` starting with ``'scholarly'``),
+    padded from a second scholarly-only query that ignores ``series_hint``.
+
     Args:
         query: Free-form search string. Typically the metric name plus the
             slice's analysis prompt.
         k: Maximum chunks to return.
         series_hint: Optional FRED series ID to up-weight matches.
+        min_scholarly: Minimum scholarly chunks to include in the result.
+            Defaults to 0 (back-compatible with Phase 11/12 callers).
 
     Returns:
         A list of ``RetrievedChunk`` (possibly empty). Never raises; any
@@ -196,6 +211,34 @@ def retrieve(
             # produce a hard empty — similarity alone is often good enough.
             result = collection.query(query_texts=[query], n_results=k)
             chunks = _rows_from_query_result(result)
+
+        if min_scholarly <= 0:
+            return chunks
+
+        scholarly_count: int = sum(
+            1 for c in chunks if c.doc_type.startswith("scholarly")
+        )
+        if scholarly_count >= min_scholarly:
+            return chunks
+
+        # Pad with a scholarly-only, series-unfiltered query.
+        pool_result = collection.query(
+            query_texts=[query],
+            n_results=min_scholarly * 3,
+            where={"doc_type": {"$nin": list(FRED_DOC_TYPES)}},
+        )
+        pool: list[RetrievedChunk] = _rows_from_query_result(pool_result)
+
+        seen: set[int] = {c.doc_id for c in chunks}
+        for c in pool:
+            if scholarly_count >= min_scholarly:
+                break
+            if c.doc_id in seen:
+                continue
+            chunks.append(c)
+            seen.add(c.doc_id)
+            scholarly_count += 1
+
         return chunks
     except Exception as e:
         if not _WARNED["missing"]:

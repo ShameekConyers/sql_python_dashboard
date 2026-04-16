@@ -3083,7 +3083,7 @@ def generate_insight(
     query: str = f"{metric_key} {slice_config['analysis_prompt'][:200]}"
     series_hint: str | None = _series_hint_for_metric(metric_key)
     retrieved: list[rag_retrieval.RetrievedChunk] = rag_retrieval.retrieve(
-        query, k=7, series_hint=series_hint
+        query, k=7, series_hint=series_hint, min_scholarly=3
     )
     reference_block, provided = _build_reference_context(retrieved)
     retrieval_empty: bool = not provided
