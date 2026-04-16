@@ -37,13 +37,15 @@ To pull fresh data from the FRED API and rebuild everything:
 
 ```bash
 python src/data_pull.py
+python src/hackernews_pull.py
+python src/sentiment_score.py
 python src/db_setup.py --full
 python src/covid_adjustment.py --full
 python src/export_csv.py --full
 python src/embed_references.py --db full --rebuild
+python src/recession_model.py --db full
 python src/ai_insights.py --db full
 python src/verify_insights.py --db full
-python src/recession_model.py --db full
 streamlit run dashboard/app.py
 ```
 
@@ -51,6 +53,24 @@ streamlit run dashboard/app.py
 with `sentence-transformers/all-MiniLM-L6-v2`, and persists the collection
 to `data/.chroma/`. `ai_insights.py` then retrieves from that store and
 writes `[ref:N]` citations into `ai_insights.citations_json`.
+
+## Hacker News Data
+
+Phase 13 adds a thinned Hacker News corpus as a tech-labor-sentiment
+signal. `src/hackernews_pull.py` uses the public Algolia HN search API
+(no auth, no API key) and caches the top 30 stories per month to
+`data/raw/hn_stories.json`. The window starts at 2022-11-01 (ChatGPT's
+public release). Story text is truncated to 500 characters at
+ingestion. `src/sentiment_score.py` scores each story with
+`cardiffnlp/twitter-roberta-base-sentiment-latest` and writes a
+compound score back to the same JSON. `db_setup.py` loads the scored
+JSON into `hn_stories` and computes `hn_sentiment_monthly` via SQL
+GROUP BY. Nothing in the dashboard or AI insights reads these tables
+in Phase 13; Phase 14 wires them in.
+
+The raw JSON is gitignored under the existing `data/raw/` rule.
+`hn_stories` ships inside `seed.db` (~1,200 rows, thinned excerpts
+only). No API credentials or `.env` entries are required.
 
 ## Reference Content
 
