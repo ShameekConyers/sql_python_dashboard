@@ -12,6 +12,13 @@
    ```bash
    pip install -r requirements-dev.txt
    ```
+   Dev install pulls in `torch` (~700 MB on macOS arm64) via
+   `sentence-transformers`, plus `chromadb`. These are generation-time-only
+   and never deployed — the dashboard reads pre-computed citations from
+   `data/seed.db` and the vector store is only rebuilt by
+   `src/embed_references.py`. First run of `embed_references.py` also
+   downloads the ~80 MB `all-MiniLM-L6-v2` model into
+   `~/.cache/huggingface/`.
 4. Copy `.env.example` to `.env` and add your FRED API key (only needed for
    `--full` mode)
 
@@ -33,11 +40,17 @@ python src/data_pull.py
 python src/db_setup.py --full
 python src/covid_adjustment.py --full
 python src/export_csv.py --full
+python src/embed_references.py --db full --rebuild
 python src/ai_insights.py --db full
 python src/verify_insights.py --db full
 python src/recession_model.py --db full
 streamlit run dashboard/app.py
 ```
+
+`embed_references.py` reads `reference_docs`, chunks each row, embeds it
+with `sentence-transformers/all-MiniLM-L6-v2`, and persists the collection
+to `data/.chroma/`. `ai_insights.py` then retrieves from that store and
+writes `[ref:N]` citations into `ai_insights.citations_json`.
 
 ## Running Tests
 

@@ -443,16 +443,18 @@ class TestStoreInsight:
         ]
         ai_insights._store_insight(
             test_db, "TEST_METRIC", "2023-2024", "trend",
-            "Test narrative.", claims, "llama3.1:8b",
+            "Test narrative.", claims, [], "llama3.1:8b",
         )
         row = test_db.execute(
-            "SELECT metric_key, insight_type, narrative, all_verified "
+            "SELECT metric_key, insight_type, narrative, all_verified, "
+            "       citations_json "
             "FROM ai_insights WHERE metric_key = 'TEST_METRIC'"
         ).fetchone()
         assert row is not None
         assert row[0] == "TEST_METRIC"
         assert row[1] == "trend"
         assert row[3] == 0  # all_verified defaults to 0
+        assert row[4] == "[]"  # empty citations
 
     def test_upsert_idempotent(
         self, test_db: sqlite3.Connection
@@ -463,17 +465,42 @@ class TestStoreInsight:
         ]
         ai_insights._store_insight(
             test_db, "UPSERT_KEY", "2023-2024", "trend",
-            "Narrative v1.", claims, "llama3.1:8b",
+            "Narrative v1.", claims, [], "llama3.1:8b",
         )
         ai_insights._store_insight(
             test_db, "UPSERT_KEY", "2023-2024", "trend",
-            "Narrative v2.", claims, "llama3.1:8b",
+            "Narrative v2.", claims, [], "llama3.1:8b",
         )
         count = test_db.execute(
             "SELECT COUNT(*) FROM ai_insights "
             "WHERE metric_key = 'UPSERT_KEY'"
         ).fetchone()[0]
         assert count == 1
+
+    def test_stores_citations_json(
+        self, test_db: sqlite3.Connection
+    ) -> None:
+        """Citations are persisted as a JSON array in citations_json."""
+        citations: list[dict[str, Any]] = [
+            {
+                "ref_id": 12,
+                "doc_type": "series_notes",
+                "series_id": "UNRATE",
+                "title": "FRED Series Notes — UNRATE",
+                "source_url": "https://fred.stlouisfed.org/series/UNRATE",
+                "excerpt": "The unemployment rate represents...",
+            }
+        ]
+        ai_insights._store_insight(
+            test_db, "CIT_KEY", "2023-2024", "trend",
+            "Narrative.", [], citations, "llama3.1:8b",
+        )
+        row = test_db.execute(
+            "SELECT citations_json FROM ai_insights "
+            "WHERE metric_key = 'CIT_KEY'"
+        ).fetchone()
+        stored: list[dict[str, Any]] = json.loads(row[0])
+        assert stored == citations
 
 
 # ---------------------------------------------------------------------------
@@ -645,3 +672,387 @@ class TestSeriesKind:
             assert series_id in ai_insights.SERIES_KIND, (
                 f"{series_id} missing from SERIES_KIND"
             )
+
+
+# ---------------------------------------------------------------------------
+# Phase 11: RAG citation tests
+# ---------------------------------------------------------------------------
+
+
+def _make_chunk(
+    doc_id: int,
+    series_id: str = "UNRATE",
+    doc_type: str = "series_notes",
+    title: str = "FRED Series Notes — UNRATE",
+    content: str = "The unemployment rate represents the unemployed as a percentage of the labor force.",
+    source_url: str | None = "https://fred.stlouisfed.org/series/UNRATE",
+) -> Any:
+    """Build a RetrievedChunk for tests. Imports locally to avoid top-level."""
+    from rag_retrieval import RetrievedChunk
+
+    return RetrievedChunk(
+        doc_id=doc_id,
+        series_id=series_id,
+        doc_type=doc_type,
+        title=title,
+        content=content,
+        source_url=source_url,
+        score=0.1,
+    )
+
+
+class TestRule7InSystemPrompt:
+    """Tests for the Phase 11 RULE 7 clause in SYSTEM_PROMPT."""
+
+    def test_rule_7_present(self) -> None:
+        """SYSTEM_PROMPT contains the RULE 7 header."""
+        assert "7. CITATIONS." in ai_insights.SYSTEM_PROMPT
+
+    def test_rule_7_references_ref_tag_format(self) -> None:
+        """RULE 7 instructs the LLM to use [ref:N] tags."""
+        assert "[ref:N]" in ai_insights.SYSTEM_PROMPT
+
+    def test_rule_7_limits_citations(self) -> None:
+        """RULE 7 asks for at most two citations."""
+        assert "at most two" in ai_insights.SYSTEM_PROMPT.lower()
+
+    def test_rules_1_through_6_still_present(self) -> None:
+        """Phase 10 rules 1-6 are preserved (not rewritten)."""
+        for n in range(1, 7):
+            assert f"{n}. " in ai_insights.SYSTEM_PROMPT
+
+
+class TestSeriesHintForMetric:
+    """Tests for _series_hint_for_metric."""
+
+    def test_single_series_returns_self(self) -> None:
+        """A metric_key that is a FRED series id returns itself."""
+        assert ai_insights._series_hint_for_metric("GDPC1") == "GDPC1"
+
+    def test_composite_returns_leading_series(self) -> None:
+        """Composite keys resolve to the first series id."""
+        assert (
+            ai_insights._series_hint_for_metric("T10Y2Y_UNRATE") == "T10Y2Y"
+        )
+        assert (
+            ai_insights._series_hint_for_metric("USINFO_CES2023800001")
+            == "USINFO"
+        )
+
+    def test_cross_series_returns_none(self) -> None:
+        """Cross-series slices skip the filter."""
+        for key in (
+            "dashboard_intro",
+            "recession_risk",
+            "synthesis",
+            "scenario_explorer",
+        ):
+            assert ai_insights._series_hint_for_metric(key) is None
+
+
+class TestBuildReferenceContext:
+    """Tests for _build_reference_context."""
+
+    def test_empty_returns_none_marker(self) -> None:
+        """Empty retrieval produces a '(none)' placeholder block."""
+        block, provided = ai_insights._build_reference_context([])
+        assert "REFERENCE CONTEXT: (none)" in block
+        assert provided == {}
+
+    def test_emits_ref_tags_and_source_urls(self) -> None:
+        """Each unique doc_id gets a [ref:N] entry with its URL."""
+        chunks = [
+            _make_chunk(doc_id=12, title="FRED Series Notes — UNRATE"),
+            _make_chunk(
+                doc_id=15,
+                doc_type="release_info",
+                title="Release — Employment Situation",
+                content="Monthly BLS release of payroll data.",
+                source_url="https://www.bls.gov/empsit",
+            ),
+        ]
+        block, provided = ai_insights._build_reference_context(chunks)
+        assert "[ref:12]" in block
+        assert "[ref:15]" in block
+        assert "https://fred.stlouisfed.org/series/UNRATE" in block
+        assert "https://www.bls.gov/empsit" in block
+        assert set(provided.keys()) == {12, 15}
+
+    def test_deduplicates_by_doc_id(self) -> None:
+        """Multiple chunks from the same doc_id yield one entry."""
+        chunks = [
+            _make_chunk(doc_id=12, content="First chunk of the same doc."),
+            _make_chunk(doc_id=12, content="Second chunk of the same doc."),
+        ]
+        block, provided = ai_insights._build_reference_context(chunks)
+        # Only one [ref:12] block
+        assert block.count("[ref:12]") == 1
+        assert set(provided.keys()) == {12}
+
+
+class TestExtractCitations:
+    """Tests for _extract_citations."""
+
+    def test_valid_tag_is_stripped_and_recorded(self) -> None:
+        """A valid [ref:N] produces a citation and disappears from prose."""
+        provided = {12: _make_chunk(doc_id=12)}
+        narrative: str = "Unemployment sits at 4% [ref:12]."
+
+        stripped, records, warnings = ai_insights._extract_citations(
+            narrative, provided
+        )
+
+        assert "[ref:12]" not in stripped
+        assert stripped.endswith(".")
+        assert len(records) == 1
+        assert records[0]["ref_id"] == 12
+        assert records[0]["series_id"] == "UNRATE"
+        assert records[0]["source_url"].startswith("https://fred")
+        assert warnings == []
+
+    def test_invalid_tag_stays_and_warns(self) -> None:
+        """Tags whose id is not in provided stay visible and warn."""
+        provided = {12: _make_chunk(doc_id=12)}
+        narrative: str = "Unemployment sits at 4% [ref:99]."
+
+        stripped, records, warnings = ai_insights._extract_citations(
+            narrative, provided
+        )
+
+        assert "[ref:99]" in stripped
+        assert records == []
+        assert warnings
+        assert "hallucinated" in warnings[0].lower()
+
+    def test_duplicate_valid_tags_dedupe(self) -> None:
+        """Multiple occurrences of the same valid id produce one record."""
+        provided = {12: _make_chunk(doc_id=12)}
+        narrative: str = (
+            "Unemployment is stable [ref:12]. Methodology is [ref:12] "
+            "defined by BLS."
+        )
+
+        stripped, records, warnings = ai_insights._extract_citations(
+            narrative, provided
+        )
+
+        assert "[ref:12]" not in stripped
+        assert len(records) == 1
+        assert records[0]["ref_id"] == 12
+
+    def test_mixed_valid_and_invalid(self) -> None:
+        """Valid tags are stripped; invalid tags survive; records only valid."""
+        provided = {12: _make_chunk(doc_id=12)}
+        narrative: str = (
+            "Unemployment [ref:12] is at 4% [ref:77]."
+        )
+
+        stripped, records, warnings = ai_insights._extract_citations(
+            narrative, provided
+        )
+
+        assert "[ref:12]" not in stripped
+        assert "[ref:77]" in stripped
+        assert len(records) == 1
+        assert records[0]["ref_id"] == 12
+        assert warnings
+
+    def test_no_tags_returns_narrative_unchanged(self) -> None:
+        """A narrative without [ref:N] tags passes through unchanged."""
+        provided = {12: _make_chunk(doc_id=12)}
+        narrative: str = "Nothing to cite here."
+
+        stripped, records, warnings = ai_insights._extract_citations(
+            narrative, provided
+        )
+
+        assert stripped == narrative
+        assert records == []
+        assert warnings == []
+
+    def test_excerpt_truncated_for_long_content(self) -> None:
+        """Long source content is truncated to a reasonable excerpt length."""
+        long_content: str = "x" * 800
+        provided = {
+            42: _make_chunk(doc_id=42, content=long_content)
+        }
+        narrative: str = "Something [ref:42]."
+
+        _, records, _ = ai_insights._extract_citations(narrative, provided)
+
+        assert len(records) == 1
+        assert len(records[0]["excerpt"]) <= 240
+        assert records[0]["excerpt"].endswith("...")
+
+
+class TestValidateNarrativeCitations:
+    """Tests for citation-aware extensions to _validate_narrative."""
+
+    def test_merges_citation_warnings(self) -> None:
+        """Citation warnings from _extract_citations are merged into output."""
+        warnings = ai_insights._validate_narrative(
+            "Clean narrative.",
+            "UNRATE",
+            citation_warnings=[
+                "Narrative cites [ref:99] but that id was not in REFERENCE "
+                "CONTEXT (hallucinated citation)."
+            ],
+            retrieval_empty=False,
+            citation_count=0,
+        )
+        assert any("hallucinated" in w.lower() for w in warnings)
+
+    def test_methodology_without_citation_when_refs_present(self) -> None:
+        """Methodology language without citations warns when refs were present."""
+        warnings = ai_insights._validate_narrative(
+            "Unemployment is published by the Bureau of Labor Statistics "
+            "each month.",
+            "UNRATE",
+            retrieval_empty=False,
+            citation_count=0,
+        )
+        assert any("methodology" in w.lower() for w in warnings)
+
+    def test_skips_methodology_check_when_retrieval_empty(self) -> None:
+        """If REFERENCE CONTEXT was empty, methodology phrasing is OK."""
+        warnings = ai_insights._validate_narrative(
+            "Unemployment is published by the Bureau of Labor Statistics.",
+            "UNRATE",
+            retrieval_empty=True,
+            citation_count=0,
+        )
+        assert not any("methodology" in w.lower() for w in warnings)
+
+    def test_warns_when_too_many_citations(self) -> None:
+        """RULE 7 cap: >2 citations triggers a warning."""
+        warnings = ai_insights._validate_narrative(
+            "Plain narrative.",
+            "UNRATE",
+            retrieval_empty=False,
+            citation_count=4,
+        )
+        assert any(
+            "at most two" in w.lower() or "4 citations" in w.lower()
+            for w in warnings
+        )
+
+    def test_accepts_two_citations(self) -> None:
+        """Exactly two citations passes without warning."""
+        warnings = ai_insights._validate_narrative(
+            "Plain narrative.",
+            "UNRATE",
+            retrieval_empty=False,
+            citation_count=2,
+        )
+        assert not any(
+            "at most two" in w.lower() or "citations" in w.lower()
+            for w in warnings
+        )
+
+
+class TestGenerateInsightRagWiring:
+    """Tests for the RAG integration inside generate_insight."""
+
+    @patch("ai_insights._call_llm")
+    @patch("ai_insights.rag_retrieval.retrieve")
+    def test_reference_context_injected_into_prompt(
+        self,
+        mock_retrieve: MagicMock,
+        mock_llm: MagicMock,
+        test_db: sqlite3.Connection,
+    ) -> None:
+        """generate_insight inserts REFERENCE CONTEXT into the user prompt."""
+        mock_retrieve.return_value = [_make_chunk(doc_id=12)]
+        mock_llm.return_value = (
+            "Unemployment sits at 4% [ref:12], consistent with cooling."
+        )
+
+        slice_config: dict[str, Any] = {
+            "metric_key": "UNRATE",
+            "insight_type": "trend",
+            "context_fn": ai_insights._context_gdp_trend,
+            "claims_fn": ai_insights._claims_gdp_trend,
+            "analysis_prompt": "Test prompt for UNRATE analysis.",
+        }
+
+        result: bool = ai_insights.generate_insight(
+            test_db, "llama3.1:8b", slice_config, "2023-2024"
+        )
+        assert result is True
+
+        # Verify the LLM was called with a prompt containing REFERENCE CONTEXT
+        prompt_sent: str = mock_llm.call_args[0][1]
+        assert "REFERENCE CONTEXT:" in prompt_sent
+        assert "[ref:12]" in prompt_sent
+
+        # Verify retrieval was called with the UNRATE series_hint
+        retrieve_kwargs = mock_retrieve.call_args.kwargs
+        assert retrieve_kwargs["series_hint"] == "UNRATE"
+
+        # The stored narrative has the tag stripped
+        row = test_db.execute(
+            "SELECT narrative, citations_json FROM ai_insights "
+            "WHERE metric_key = 'UNRATE'"
+        ).fetchone()
+        assert "[ref:12]" not in row[0]
+        citations: list[dict[str, Any]] = json.loads(row[1])
+        assert len(citations) == 1
+        assert citations[0]["ref_id"] == 12
+
+    @patch("ai_insights._call_llm")
+    @patch("ai_insights.rag_retrieval.retrieve")
+    def test_empty_retrieval_emits_none_marker(
+        self,
+        mock_retrieve: MagicMock,
+        mock_llm: MagicMock,
+        test_db: sqlite3.Connection,
+    ) -> None:
+        """With retrieval empty, the user prompt shows 'REFERENCE CONTEXT: (none)'."""
+        mock_retrieve.return_value = []
+        mock_llm.return_value = "Plain narrative without any citations."
+
+        slice_config: dict[str, Any] = {
+            "metric_key": "GDPC1",
+            "insight_type": "trend",
+            "context_fn": ai_insights._context_gdp_trend,
+            "claims_fn": ai_insights._claims_gdp_trend,
+            "analysis_prompt": "GDP analysis.",
+        }
+
+        ai_insights.generate_insight(
+            test_db, "llama3.1:8b", slice_config, "2023-2024"
+        )
+
+        prompt_sent: str = mock_llm.call_args[0][1]
+        assert "REFERENCE CONTEXT: (none)" in prompt_sent
+        row = test_db.execute(
+            "SELECT citations_json FROM ai_insights "
+            "WHERE metric_key = 'GDPC1'"
+        ).fetchone()
+        assert row[0] == "[]"
+
+    @patch("ai_insights._call_llm")
+    @patch("ai_insights.rag_retrieval.retrieve")
+    def test_cross_series_metric_uses_none_hint(
+        self,
+        mock_retrieve: MagicMock,
+        mock_llm: MagicMock,
+        test_db: sqlite3.Connection,
+    ) -> None:
+        """Cross-series slices pass series_hint=None to retrieval."""
+        mock_retrieve.return_value = []
+        mock_llm.return_value = "Synthesis narrative."
+
+        slice_config: dict[str, Any] = {
+            "metric_key": "synthesis",
+            "insight_type": "trend",
+            "context_fn": ai_insights._context_synthesis,
+            "claims_fn": ai_insights._claims_synthesis,
+            "analysis_prompt": "Synthesize everything.",
+        }
+
+        ai_insights.generate_insight(
+            test_db, "llama3.1:8b", slice_config, "2023-2024"
+        )
+
+        assert mock_retrieve.call_args.kwargs["series_hint"] is None

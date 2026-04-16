@@ -731,3 +731,198 @@ class TestEdgeCases:
             test_db, "UNRATE", "2030-01", "2030-12", "end"
         )
         assert val is None
+
+
+# ---------------------------------------------------------------------------
+# Phase 11: citation verification
+# ---------------------------------------------------------------------------
+
+
+REFERENCE_SCHEMA_SQL: str = (
+    verify_insights.PROJECT_ROOT / "sql" / "06_reference_schema.sql"
+).read_text()
+
+
+@pytest.fixture()
+def db_with_refs() -> sqlite3.Connection:
+    """Return an in-memory DB with reference_docs populated."""
+    conn: sqlite3.Connection = sqlite3.connect(":memory:")
+    conn.executescript(SCHEMA_SQL)
+    conn.executescript(REFERENCE_SCHEMA_SQL)
+    # One minimal series_metadata row for FK integrity
+    conn.execute(
+        "INSERT INTO series_metadata "
+        "(series_id, name, category, frequency, units) "
+        "VALUES (?, ?, ?, ?, ?)",
+        ("UNRATE", "Unemployment Rate", "labor_market", "monthly", "Percent"),
+    )
+    conn.execute(
+        "INSERT INTO reference_docs "
+        "(id, series_id, doc_type, title, content, source_url, fetched_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (
+            12,
+            "UNRATE",
+            "series_notes",
+            "FRED Series Notes — UNRATE",
+            (
+                "The unemployment rate represents the number of unemployed "
+                "as a percentage of the labor force. Labor force data are "
+                "restricted to people 16 years of age and older."
+            ),
+            "https://fred.stlouisfed.org/series/UNRATE",
+            "2026-04-16T00:00:00+00:00",
+        ),
+    )
+    conn.commit()
+    return conn
+
+
+class TestVerifyCitations:
+    """Tests for _verify_citations."""
+
+    def test_valid_ref_and_excerpt(
+        self, db_with_refs: sqlite3.Connection
+    ) -> None:
+        """Existing ref with matching excerpt passes both flags."""
+        citations: list[dict[str, Any]] = [
+            {
+                "ref_id": 12,
+                "doc_type": "series_notes",
+                "series_id": "UNRATE",
+                "title": "FRED Series Notes — UNRATE",
+                "source_url": "https://fred.stlouisfed.org/series/UNRATE",
+                "excerpt": "The unemployment rate represents the number of unemployed...",
+            }
+        ]
+        results = verify_insights._verify_citations(db_with_refs, citations)
+        assert len(results) == 1
+        assert results[0]["ref_exists"] is True
+        assert results[0]["excerpt_matches"] is True
+
+    def test_missing_ref(self, db_with_refs: sqlite3.Connection) -> None:
+        """A ref_id that does not exist in reference_docs fails both."""
+        citations: list[dict[str, Any]] = [
+            {
+                "ref_id": 999,
+                "title": "Fake Ref",
+                "excerpt": "irrelevant",
+            }
+        ]
+        results = verify_insights._verify_citations(db_with_refs, citations)
+        assert len(results) == 1
+        assert results[0]["ref_exists"] is False
+        assert results[0]["excerpt_matches"] is False
+
+    def test_fabricated_excerpt(
+        self, db_with_refs: sqlite3.Connection
+    ) -> None:
+        """Real ref_id but invented excerpt passes exists, fails match."""
+        citations: list[dict[str, Any]] = [
+            {
+                "ref_id": 12,
+                "title": "FRED Series Notes — UNRATE",
+                "excerpt": "This excerpt was invented by the LLM entirely.",
+            }
+        ]
+        results = verify_insights._verify_citations(db_with_refs, citations)
+        assert results[0]["ref_exists"] is True
+        assert results[0]["excerpt_matches"] is False
+
+    def test_excerpt_matches_is_case_insensitive(
+        self, db_with_refs: sqlite3.Connection
+    ) -> None:
+        """Case differences in the excerpt do not defeat the match."""
+        citations: list[dict[str, Any]] = [
+            {
+                "ref_id": 12,
+                "excerpt": "THE UNEMPLOYMENT RATE REPRESENTS THE NUMBER OF UNEMPLOYED",
+            }
+        ]
+        results = verify_insights._verify_citations(db_with_refs, citations)
+        assert results[0]["excerpt_matches"] is True
+
+    def test_empty_citations_returns_empty(
+        self, db_with_refs: sqlite3.Connection
+    ) -> None:
+        """An empty citations list returns an empty verification list."""
+        assert verify_insights._verify_citations(db_with_refs, []) == []
+
+    def test_preserves_original_keys(
+        self, db_with_refs: sqlite3.Connection
+    ) -> None:
+        """Original citation fields are preserved in the augmented result."""
+        citations: list[dict[str, Any]] = [
+            {
+                "ref_id": 12,
+                "title": "FRED Series Notes — UNRATE",
+                "excerpt": "The unemployment rate represents the number...",
+                "source_url": "https://fred.stlouisfed.org/series/UNRATE",
+            }
+        ]
+        results = verify_insights._verify_citations(db_with_refs, citations)
+        assert results[0]["title"] == "FRED Series Notes — UNRATE"
+        assert (
+            results[0]["source_url"] == "https://fred.stlouisfed.org/series/UNRATE"
+        )
+
+
+class TestVerifyInsightWithCitations:
+    """Tests for verify_insight when citations_json is included."""
+
+    def test_verification_json_carries_citations_block(
+        self, db_with_refs: sqlite3.Connection
+    ) -> None:
+        """verify_insight adds a 'citations' sub-array to verification_json."""
+        citations_json: str = json.dumps(
+            [
+                {
+                    "ref_id": 12,
+                    "title": "FRED Series Notes — UNRATE",
+                    "excerpt": "The unemployment rate represents the number...",
+                }
+            ]
+        )
+
+        verification, all_verified = verify_insights.verify_insight(
+            db_with_refs, row_id=1, claims_json="[]", citations_json=citations_json
+        )
+
+        assert "citations" in verification
+        assert len(verification["citations"]) == 1
+        assert verification["citations"][0]["ref_exists"] is True
+        # Citation failures do NOT flip all_verified; with no claims it stays True
+        assert all_verified is True
+
+    def test_citation_failure_does_not_change_all_verified(
+        self, db_with_refs: sqlite3.Connection
+    ) -> None:
+        """A missing ref_id must not flip the main verification banner."""
+        citations_json: str = json.dumps(
+            [{"ref_id": 9999, "excerpt": "fake"}]
+        )
+
+        verification, all_verified = verify_insights.verify_insight(
+            db_with_refs, row_id=1, claims_json="[]", citations_json=citations_json
+        )
+
+        assert all_verified is True
+        assert verification["citations"][0]["ref_exists"] is False
+
+    def test_default_citations_json_is_empty_list(
+        self, db_with_refs: sqlite3.Connection
+    ) -> None:
+        """Callers that omit citations_json still get a 'citations' key."""
+        verification, _ = verify_insights.verify_insight(
+            db_with_refs, row_id=1, claims_json="[]"
+        )
+        assert verification["citations"] == []
+
+    def test_malformed_citations_json_is_tolerated(
+        self, db_with_refs: sqlite3.Connection
+    ) -> None:
+        """Bad JSON in citations_json does not break verification."""
+        verification, _ = verify_insights.verify_insight(
+            db_with_refs, row_id=1, claims_json="[]", citations_json="not-json"
+        )
+        assert verification["citations"] == []

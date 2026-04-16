@@ -833,10 +833,83 @@ def verify_claim(
         }
 
 
+def _normalize_for_substring(text: str) -> str:
+    """Normalize text for tolerant substring matching.
+
+    Lowercases, collapses runs of whitespace, and strips leading/trailing
+    whitespace so that excerpt comparisons do not fail on newline or
+    capitalization drift.
+
+    Args:
+        text: Raw text.
+
+    Returns:
+        Normalized string.
+    """
+    import re as _re  # local to avoid shadowing module-level re if any
+
+    return _re.sub(r"\s+", " ", text).strip().lower()
+
+
+def _verify_citations(
+    conn: sqlite3.Connection,
+    citations: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Verify every citation in ``citations`` against ``reference_docs``.
+
+    For each cited ``ref_id``:
+      * ``ref_exists``: strict — id must exist in reference_docs.
+      * ``excerpt_matches``: fuzzy — the first 60 chars of the stored
+        excerpt (case-insensitive, whitespace-normalized) must appear in
+        the source's ``content``. This catches an LLM that fabricated an
+        excerpt for a real ref_id.
+
+    Args:
+        conn: SQLite database connection.
+        citations: The citations_json list parsed from an insight.
+
+    Returns:
+        A list parallel to ``citations`` where each entry is augmented
+        with ``ref_exists`` and ``excerpt_matches`` booleans.
+    """
+    results: list[dict[str, Any]] = []
+    for entry in citations:
+        ref_id = entry.get("ref_id")
+        augmented: dict[str, Any] = dict(entry)
+        augmented["ref_exists"] = False
+        augmented["excerpt_matches"] = False
+
+        if ref_id is None:
+            results.append(augmented)
+            continue
+
+        row = conn.execute(
+            "SELECT content FROM reference_docs WHERE id = ?",
+            (ref_id,),
+        ).fetchone()
+        if row is None:
+            results.append(augmented)
+            continue
+
+        augmented["ref_exists"] = True
+        source_content: str = row[0] or ""
+        excerpt: str = str(entry.get("excerpt") or "")
+        # Strip any trailing ellipsis inserted by _extract_citations
+        excerpt_clean: str = excerpt.rstrip(".").rstrip()
+        probe: str = _normalize_for_substring(excerpt_clean[:60])
+        haystack: str = _normalize_for_substring(source_content)
+        augmented["excerpt_matches"] = bool(probe) and probe in haystack
+
+        results.append(augmented)
+
+    return results
+
+
 def verify_insight(
     conn: sqlite3.Connection,
     row_id: int,
     claims_json: str,
+    citations_json: str = "[]",
 ) -> tuple[dict[str, Any], bool]:
     """Verify all claims for a single insight.
 
@@ -844,9 +917,15 @@ def verify_insight(
         conn: SQLite database connection.
         row_id: The ai_insights row ID.
         claims_json: JSON string of claims array.
+        citations_json: JSON string of citations array (Phase 11). Defaults
+            to an empty array so pre-Phase-11 callers still work.
 
     Returns:
-        Tuple of (verification_json dict, all_verified bool).
+        Tuple of (verification_json dict, all_verified bool). The
+        ``verification_json`` gains a ``citations`` key containing the
+        augmented citation records. Citation failures do NOT flip
+        ``all_verified``; per Phase 11 policy, only numeric claim results
+        drive the main banner.
     """
     claims: list[dict[str, Any]] = json.loads(claims_json)
     results: dict[str, Any] = {
@@ -859,6 +938,13 @@ def verify_insight(
         results[str(i)] = result
         if not result["passed"]:
             all_passed = False
+
+    # Phase 11: verify citations alongside claims. Non-blocking.
+    try:
+        citations: list[dict[str, Any]] = json.loads(citations_json or "[]")
+    except json.JSONDecodeError:
+        citations = []
+    results["citations"] = _verify_citations(conn, citations)
 
     return results, all_passed
 
@@ -876,7 +962,7 @@ def verify_all(db_mode: str = "seed") -> None:
 
     conn: sqlite3.Connection = sqlite3.connect(db_file)
     rows = conn.execute(
-        "SELECT id, metric_key, insight_type, claims_json "
+        "SELECT id, metric_key, insight_type, claims_json, citations_json "
         "FROM ai_insights"
     ).fetchall()
 
@@ -886,10 +972,16 @@ def verify_all(db_mode: str = "seed") -> None:
         return
 
     verified_count: int = 0
-    for row_id, metric_key, insight_type, claims_json in rows:
+    for (
+        row_id,
+        metric_key,
+        insight_type,
+        claims_json,
+        citations_json,
+    ) in rows:
         logger.info("Verifying: %s / %s", metric_key, insight_type)
         verification, all_verified = verify_insight(
-            conn, row_id, claims_json
+            conn, row_id, claims_json, citations_json or "[]"
         )
 
         conn.execute(

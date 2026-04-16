@@ -114,11 +114,12 @@ def get_ai_insight(metric_key: str, insight_type: str, full: bool = False) -> di
 
     Returns:
         A dict with narrative, claims_json, verification_json, all_verified,
-        or None if no matching row exists.
+        and citations_json, or None if no matching row exists.
     """
     df = run_query(
         f"""
-        SELECT narrative, claims_json, verification_json, all_verified
+        SELECT narrative, claims_json, verification_json, all_verified,
+               citations_json
         FROM ai_insights
         WHERE metric_key = '{metric_key}' AND insight_type = '{insight_type}'
         LIMIT 1
@@ -133,6 +134,7 @@ def get_ai_insight(metric_key: str, insight_type: str, full: bool = False) -> di
         "claims_json": row["claims_json"],
         "verification_json": row["verification_json"],
         "all_verified": bool(row["all_verified"]),
+        "citations_json": row["citations_json"] or "[]",
     }
 
 
@@ -338,6 +340,17 @@ def render_ai_insight_block(metric_key: str, insight_type: str, full: bool = Fal
     else:
         banner = ":red[**Unverified**] — no claims could be confirmed."
 
+    # Parse citations for the References section (Phase 11)
+    try:
+        citations: list[dict] = json.loads(insight.get("citations_json", "[]"))
+    except (json.JSONDecodeError, TypeError):
+        citations = []
+
+    # Pull per-citation verification results (ref_exists, excerpt_matches)
+    citation_verifications: list[dict] = (
+        verification.get("citations", []) if isinstance(verification, dict) else []
+    )
+
     with st.expander("AI Insight", expanded=True):
         st.markdown(banner)
         st.markdown(insight["narrative"])
@@ -367,6 +380,34 @@ def render_ai_insight_block(metric_key: str, insight_type: str, full: bool = Fal
                     _color_status, subset=["Status"]
                 )
                 st.dataframe(styled, use_container_width=True, hide_index=True)
+
+            if citations:
+                st.markdown("---")
+                st.markdown("**Reference Citations**")
+                # Build a lookup of verification results by ref_id so each
+                # cited source can show a ✓ or ⚠ icon derived from
+                # ref_exists && excerpt_matches.
+                verification_by_id: dict[int, dict] = {
+                    int(v.get("ref_id")): v
+                    for v in citation_verifications
+                    if v.get("ref_id") is not None
+                }
+                for cit in citations:
+                    ref_id: int = int(cit.get("ref_id", 0))
+                    ver = verification_by_id.get(ref_id, {})
+                    ok: bool = bool(
+                        ver.get("ref_exists") and ver.get("excerpt_matches")
+                    )
+                    icon: str = "✓" if ok else "⚠"
+                    title: str = cit.get("title", f"Reference {ref_id}")
+                    excerpt: str = cit.get("excerpt", "")
+                    source_url: str | None = cit.get("source_url")
+                    st.markdown(f"**{title}** {icon}")
+                    if excerpt:
+                        st.markdown(f"> {excerpt}")
+                    if source_url:
+                        st.markdown(f"Source: [{source_url}]({source_url})")
+                    st.markdown("")
 
 
 # ---------------------------------------------------------------------------

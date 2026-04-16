@@ -24,6 +24,8 @@ from typing import Any
 import httpx
 import pandas as pd
 
+import rag_retrieval
+
 PROJECT_ROOT: Path = Path(__file__).resolve().parent.parent
 DATA_DIR: Path = PROJECT_ROOT / "data"
 
@@ -124,6 +126,22 @@ Each tuple is (pattern, human-readable message). Warnings are logged; storage
 is never blocked. Operators judge whether to regenerate flagged slices.
 """
 
+METHODOLOGY_LANGUAGE_RE: re.Pattern[str] = re.compile(
+    r"(?i)\b("
+    r"published by"
+    r"|seasonally adjusted"
+    r"|as defined by"
+    r"|measured by"
+    r"|(?:the\s+)?(?:bls|bureau of labor statistics|bea|federal reserve)"
+    r")\b"
+)
+"""Methodology phrasing that should be accompanied by a citation.
+
+Only consulted in _validate_narrative when retrieval actually returned
+chunks. If REFERENCE CONTEXT was empty, this check is skipped because the
+narrative had no refs to cite.
+"""
+
 SYSTEM_PROMPT: str = """\
 You are an economic analyst writing insights for a macro economic dashboard \
 that tracks recession indicators, AI's impact on the labor market, and energy \
@@ -161,6 +179,12 @@ prove it.
 per-capita employment index and a power output index). If the context \
 provides a precomputed gap, reference it as given; do not compute a new \
 gap in the narrative.
+7. CITATIONS. When you reference methodology, how a series is measured, \
+who publishes it, or what category it belongs to, cite the supporting \
+reference using its [ref:N] tag exactly as it appears in REFERENCE \
+CONTEXT. Do not invent tags. Do not cite a tag that is not in REFERENCE \
+CONTEXT. If REFERENCE CONTEXT is empty, write the narrative without \
+citations. Cite at most two references per narrative.
 
 Return ONLY the narrative text. No JSON, no markdown, no bullet points, \
 no preamble like "Here is...". Just the paragraph.
@@ -2535,7 +2559,11 @@ INSIGHT_SLICES: list[dict[str, Any]] = [
             "into a single narrative about AI's structural impact "
             "on work. Do not subtract the per-capita employment "
             "index from the power output index — they are on "
-            "different scales. Reference each series on its own."
+            "different scales. Reference each series on its own. "
+            "The info and trades series are EMPLOYMENT indexes; "
+            "never call them 'output,' 'productivity,' or "
+            "'activity.' Only IPG2211S is an output (power "
+            "production) index."
         ),
     },
     {
@@ -2736,17 +2764,32 @@ def _parse_narrative(raw_text: str) -> str:
 def _validate_narrative(
     narrative: str,
     metric_key: str,
+    *,
+    citation_warnings: list[str] | None = None,
+    retrieval_empty: bool = False,
+    citation_count: int = 0,
 ) -> list[str]:
     """Scan a narrative for known anti-patterns and emit warnings.
 
     Runs after _parse_narrative(). Each regex in NARRATIVE_PATTERNS that
-    matches produces a warning string. Warnings are logged and returned for
-    optional re-generation. Storage is NOT blocked — operators decide
-    whether to rerun.
+    matches produces a warning string. Phase 11 adds three citation-aware
+    checks: stray [ref:N] tags (emitted by _extract_citations via
+    ``citation_warnings``), methodology phrasing without any citation when
+    refs were actually available, and more than two citations per narrative.
+    Warnings are logged and returned for optional re-generation. Storage is
+    NOT blocked — operators decide whether to rerun.
 
     Args:
-        narrative: Cleaned narrative text.
+        narrative: Cleaned narrative text, AFTER _extract_citations has run.
         metric_key: The slice's metric_key, for log context.
+        citation_warnings: Warnings already produced by _extract_citations
+            (stray tags). Merged into the returned list so the caller does
+            not need to reason about two separate warning streams.
+        retrieval_empty: True when REFERENCE CONTEXT for this slice was
+            empty. Skips the methodology-without-citation check because no
+            refs were available to cite.
+        citation_count: Number of citation records produced. Warns when
+            greater than 2 (RULE 7 asks for "at most two references").
 
     Returns:
         List of warning strings. Empty list means the narrative is clean.
@@ -2758,6 +2801,33 @@ def _validate_narrative(
             logger.warning(
                 "Narrative validator flagged %s: %s", metric_key, message
             )
+
+    if citation_warnings:
+        for w in citation_warnings:
+            warnings.append(f"[{metric_key}] {w}")
+            logger.warning("Narrative validator flagged %s: %s", metric_key, w)
+
+    # Methodology language without any citation — only fires when refs were
+    # available. Skips the check when retrieval returned nothing so the
+    # narrative cannot be faulted for failing to cite something that never
+    # existed in REFERENCE CONTEXT.
+    if not retrieval_empty and citation_count == 0:
+        if METHODOLOGY_LANGUAGE_RE.search(narrative):
+            msg: str = (
+                "Narrative uses methodology phrasing but has no "
+                "citations — consider whether a [ref:N] was warranted."
+            )
+            warnings.append(f"[{metric_key}] {msg}")
+            logger.warning("Narrative validator flagged %s: %s", metric_key, msg)
+
+    if citation_count > 2:
+        msg = (
+            f"Narrative has {citation_count} citations; RULE 7 asks for "
+            "at most two."
+        )
+        warnings.append(f"[{metric_key}] {msg}")
+        logger.warning("Narrative validator flagged %s: %s", metric_key, msg)
+
     return warnings
 
 
@@ -2768,6 +2838,7 @@ def _store_insight(
     insight_type: str,
     narrative: str,
     claims: list[dict[str, Any]],
+    citations: list[dict[str, Any]],
     model: str,
 ) -> None:
     """Store a generated insight in the ai_insights table.
@@ -2779,15 +2850,21 @@ def _store_insight(
         metric_key: The metric key for this insight.
         slice_key: The time period slice key.
         insight_type: The insight type (trend, correlation, comparison).
-        narrative: LLM-generated narrative paragraph.
+        narrative: LLM-generated narrative paragraph, with valid [ref:N]
+            tags already stripped by _extract_citations.
         claims: Pre-computed verifiable claims list.
+        citations: List of citation records. Each record has keys
+            ``ref_id``, ``doc_type``, ``series_id``, ``title``,
+            ``source_url``, and ``excerpt`` (see _extract_citations).
+            Stored as ``citations_json``.
         model: Model name used for generation.
     """
     conn.execute(
         "INSERT OR REPLACE INTO ai_insights "
         "  (metric_key, slice_key, insight_type, narrative, claims_json, "
-        "   verification_json, all_verified, model_used, generated_at) "
-        "VALUES (?, ?, ?, ?, ?, '{}', 0, ?, ?)",
+        "   verification_json, all_verified, model_used, generated_at, "
+        "   citations_json) "
+        "VALUES (?, ?, ?, ?, ?, '{}', 0, ?, ?, ?)",
         (
             metric_key,
             slice_key,
@@ -2796,9 +2873,174 @@ def _store_insight(
             json.dumps(claims),
             model,
             datetime.now(timezone.utc).isoformat(),
+            json.dumps(citations),
         ),
     )
     conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# RAG citation helpers (Phase 11)
+# ---------------------------------------------------------------------------
+
+
+_REF_TAG_RE: re.Pattern[str] = re.compile(r"\[ref:(\d+)\]")
+"""Match tags like [ref:12] and capture the numeric id."""
+
+
+# Cross-series slices where a single series_hint would be too narrow.
+# For these, retrieval runs unfiltered and similarity ranking decides.
+_CROSS_SERIES_METRICS: frozenset[str] = frozenset(
+    {
+        "dashboard_intro",
+        "overview",
+        "recession_risk",
+        "feature_snapshot",
+        "scenario_explorer",
+        "deep_divergence",
+        "deep_energy",
+        "deep_synthesis_charts",
+        "employment_growth",
+        "covid_recovery",
+        "synthesis",
+    }
+)
+
+# Composite metric_key → leading series id used as the series_hint.
+_COMPOSITE_METRIC_HINTS: dict[str, str] = {
+    "T10Y2Y_UNRATE": "T10Y2Y",
+    "USINFO_CES2023800001": "USINFO",
+    "IPG2211S_USINFO": "IPG2211S",
+    "U6_U3": "U6RATE",
+}
+
+
+def _series_hint_for_metric(metric_key: str) -> str | None:
+    """Choose a series_hint for a slice's retrieval query.
+
+    Cross-series slices return None; composite keys resolve to the leading
+    series id; everything else is assumed to be a single series id that
+    matches a reference_docs row.
+
+    Args:
+        metric_key: The slice's metric_key.
+
+    Returns:
+        A FRED series id or None.
+    """
+    if metric_key in _CROSS_SERIES_METRICS:
+        return None
+    if metric_key in _COMPOSITE_METRIC_HINTS:
+        return _COMPOSITE_METRIC_HINTS[metric_key]
+    return metric_key
+
+
+def _build_reference_context(
+    chunks: list[rag_retrieval.RetrievedChunk],
+) -> tuple[str, dict[int, rag_retrieval.RetrievedChunk]]:
+    """Format retrieved chunks as a REFERENCE CONTEXT block for the LLM.
+
+    Deduplicates by ``doc_id`` so each ``[ref:N]`` tag corresponds to one
+    reference_docs row, even when multiple chunks of that row matched.
+
+    Args:
+        chunks: Retrieval results. Pass an empty list when retrieval
+            returned nothing.
+
+    Returns:
+        Tuple of (context_block, provided_by_id). ``context_block`` is the
+        text to inject into the user prompt. ``provided_by_id`` maps each
+        ``doc_id`` that appeared in the context to its best chunk; it is
+        passed to _extract_citations as the whitelist of valid ids.
+    """
+    if not chunks:
+        return "REFERENCE CONTEXT: (none)", {}
+
+    # Keep first occurrence per doc_id (retrieval returns best-first).
+    provided: dict[int, rag_retrieval.RetrievedChunk] = {}
+    for c in chunks:
+        if c.doc_id not in provided:
+            provided[c.doc_id] = c
+
+    lines: list[str] = ["REFERENCE CONTEXT:"]
+    for doc_id, chunk in provided.items():
+        lines.append(f"[ref:{doc_id}] {chunk.title}")
+        lines.append(chunk.content.strip())
+        if chunk.source_url:
+            lines.append(f"Source: {chunk.source_url}")
+        lines.append("")  # blank line separator
+
+    return "\n".join(lines).rstrip(), provided
+
+
+def _extract_citations(
+    narrative: str,
+    provided: dict[int, rag_retrieval.RetrievedChunk],
+) -> tuple[str, list[dict[str, Any]], list[str]]:
+    """Parse [ref:N] tags out of a narrative, match to provided refs.
+
+    Behavior, matching the Phase 11 plan:
+      * Valid tag (N is a key in ``provided``): record one citation entry
+        per unique id and STRIP the tag from the narrative.
+      * Invalid tag (N not in ``provided``): emit a warning, leave the tag
+        in place so reviewers see the failure.
+      * Deduplicated: a single citation record per id even when the same id
+        is cited multiple times.
+
+    Args:
+        narrative: Raw narrative from the LLM (with [ref:N] tags).
+        provided: Mapping of doc_id → retrieved chunk, as produced by
+            _build_reference_context.
+
+    Returns:
+        Tuple of (stripped_narrative, citation_records, warnings).
+    """
+    warnings: list[str] = []
+    records: list[dict[str, Any]] = []
+    seen_valid: set[int] = set()
+
+    # Walk all matches in order so we process invalids (for warnings)
+    # before stripping the valid ones.
+    for match in _REF_TAG_RE.finditer(narrative):
+        ref_id: int = int(match.group(1))
+        if ref_id in provided:
+            if ref_id in seen_valid:
+                continue
+            seen_valid.add(ref_id)
+            chunk: rag_retrieval.RetrievedChunk = provided[ref_id]
+            excerpt: str = chunk.content.strip()
+            if len(excerpt) > 240:
+                excerpt = excerpt[:237].rstrip() + "..."
+            records.append(
+                {
+                    "ref_id": ref_id,
+                    "doc_type": chunk.doc_type,
+                    "series_id": chunk.series_id,
+                    "title": chunk.title,
+                    "source_url": chunk.source_url,
+                    "excerpt": excerpt,
+                }
+            )
+        else:
+            warnings.append(
+                f"Narrative cites [ref:{ref_id}] but that id was not in "
+                "REFERENCE CONTEXT (hallucinated citation)."
+            )
+
+    # Strip only the tags whose id is valid. Attach a single space to
+    # collapse the surrounding whitespace without mangling the sentence.
+    def _replace_valid(match: re.Match[str]) -> str:
+        """Return empty string for valid tags, original for invalid."""
+        tag_id: int = int(match.group(1))
+        return "" if tag_id in seen_valid else match.group(0)
+
+    stripped: str = _REF_TAG_RE.sub(_replace_valid, narrative)
+    # Collapse double spaces introduced by tag removal
+    stripped = re.sub(r"\s{2,}", " ", stripped)
+    stripped = re.sub(r"\s+([,.;:!?])", r"\1", stripped)
+    stripped = stripped.strip()
+
+    return stripped, records, warnings
 
 
 def generate_insight(
@@ -2808,6 +3050,10 @@ def generate_insight(
     slice_key: str,
 ) -> bool:
     """Generate a single AI insight for the given slice configuration.
+
+    Phase 11: retrieves reference chunks from the local ChromaDB store,
+    injects a REFERENCE CONTEXT block into the user prompt, and extracts
+    ``[ref:N]`` citations from the LLM response into ``citations_json``.
 
     Args:
         conn: SQLite database connection.
@@ -2832,8 +3078,19 @@ def generate_insight(
     findings: str = "\n".join(
         f"- {c['description']}" for c in claims
     )
+
+    # Retrieve supporting reference chunks (Phase 11 RAG step)
+    query: str = f"{metric_key} {slice_config['analysis_prompt'][:200]}"
+    series_hint: str | None = _series_hint_for_metric(metric_key)
+    retrieved: list[rag_retrieval.RetrievedChunk] = rag_retrieval.retrieve(
+        query, k=5, series_hint=series_hint
+    )
+    reference_block, provided = _build_reference_context(retrieved)
+    retrieval_empty: bool = not provided
+
     user_prompt: str = (
         f"DATA CONTEXT:\n{context['context_text']}\n\n"
+        f"{reference_block}\n\n"
         f"KEY FINDINGS:\n{findings}\n\n"
         f"ANALYSIS DIRECTION:\n{slice_config['analysis_prompt']}"
     )
@@ -2841,10 +3098,19 @@ def generate_insight(
     try:
         raw_response: str = _call_llm(model, user_prompt)
         narrative: str = _parse_narrative(raw_response)
-        warnings: list[str] = _validate_narrative(narrative, metric_key)
+        stripped_narrative, citation_records, citation_warnings = (
+            _extract_citations(narrative, provided)
+        )
+        warnings: list[str] = _validate_narrative(
+            stripped_narrative,
+            metric_key,
+            citation_warnings=citation_warnings,
+            retrieval_empty=retrieval_empty,
+            citation_count=len(citation_records),
+        )
         _store_insight(
             conn, metric_key, slice_key, insight_type,
-            narrative, claims, model,
+            stripped_narrative, claims, citation_records, model,
         )
         if warnings:
             logger.warning(
@@ -2855,10 +3121,11 @@ def generate_insight(
                 len(warnings),
             )
         logger.info(
-            "Stored insight: %s / %s (%d claims)",
+            "Stored insight: %s / %s (%d claims, %d citations)",
             metric_key,
             insight_type,
             len(claims),
+            len(citation_records),
         )
         return True
     except ValueError as exc:

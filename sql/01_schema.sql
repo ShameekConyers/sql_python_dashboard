@@ -63,5 +63,6 @@ CREATE TABLE IF NOT EXISTS ai_insights (
     all_verified        BOOLEAN NOT NULL,            -- 1 if every claim passed verification, 0 otherwise
     model_used          TEXT NOT NULL,               -- e.g. 'claude-haiku-4-5-20251001'
     generated_at        TIMESTAMP NOT NULL,          -- when the insight was generated
+    citations_json      TEXT NOT NULL DEFAULT '[]',  -- JSON array of RAG citation records (Phase 11)
     UNIQUE (metric_key, slice_key, insight_type)
 );

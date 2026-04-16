@@ -11,3 +11,5 @@ statsmodels==0.14.6
 streamlit==1.55.0
 plotly==6.6.0
 httpx==0.28.1
+chromadb==1.5.7
+sentence-transformers==5.4.1

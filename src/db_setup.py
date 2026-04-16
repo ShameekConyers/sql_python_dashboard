@@ -62,15 +62,43 @@ def _db_path(mode: str) -> Path:
 
 
 def _create_schema(conn: sqlite3.Connection) -> None:
-    """Read and execute the schema SQL file to create all tables.
+    """Read and execute the schema SQL files to create all tables.
+
+    Loads `01_schema.sql` (core star schema + ai_insights) followed by
+    `06_reference_schema.sql` (reference_docs for Phase 11 RAG citations).
 
     Args:
         conn: Open SQLite connection.
     """
-    schema_path: Path = SQL_DIR / "01_schema.sql"
-    schema_sql: str = schema_path.read_text()
-    conn.executescript(schema_sql)
-    logger.info("Schema created from %s", schema_path.name)
+    for schema_filename in ("01_schema.sql", "06_reference_schema.sql"):
+        schema_path: Path = SQL_DIR / schema_filename
+        schema_sql: str = schema_path.read_text()
+        conn.executescript(schema_sql)
+        logger.info("Schema applied from %s", schema_path.name)
+
+
+def _ensure_citations_column(conn: sqlite3.Connection) -> None:
+    """Add citations_json to ai_insights if the column is missing.
+
+    SQLite does not support ``ADD COLUMN IF NOT EXISTS``, so a naked ALTER in
+    a schema file would fail on the second run. This helper reads the current
+    ai_insights columns via PRAGMA and only performs the ALTER when the
+    column is absent. On a fresh DB (schema already includes the column) this
+    is a no-op; on a pre-Phase-11 DB it adds the column exactly once.
+
+    Args:
+        conn: Open SQLite connection.
+    """
+    rows = conn.execute("PRAGMA table_info('ai_insights')").fetchall()
+    columns: set[str] = {row[1] for row in rows}
+    if "citations_json" in columns:
+        return
+    conn.execute(
+        "ALTER TABLE ai_insights "
+        "ADD COLUMN citations_json TEXT NOT NULL DEFAULT '[]'"
+    )
+    conn.commit()
+    logger.info("Added citations_json column to ai_insights")
 
 
 def _load_json(series_id: str) -> dict | None:
@@ -218,6 +246,112 @@ def _load_series(
     return stats
 
 
+def _metadata_json_path(series_id: str) -> Path:
+    """Return the metadata JSON cache path for a series.
+
+    Args:
+        series_id: FRED series identifier.
+
+    Returns:
+        Path to ``data/raw/{series_id}_metadata.json``.
+    """
+    return RAW_DIR / f"{series_id}_metadata.json"
+
+
+def _load_reference_docs(conn: sqlite3.Connection, mode: str) -> int:
+    """Load reference_docs rows from cached metadata JSON files.
+
+    For each series active in ``mode``, read ``{series_id}_metadata.json``
+    from ``data/raw/`` and upsert up to three reference_docs rows:
+    ``series_notes``, ``release_info``, and ``category_path``. Rows with
+    empty content are skipped. Existing rows are replaced via
+    ``INSERT OR REPLACE`` keyed on the unique (series_id, doc_type) pair.
+
+    Args:
+        conn: Open SQLite connection.
+        mode: Either 'seed' or 'full'. Reserved for future filtering; today
+            both modes use the same 10-series set.
+
+    Returns:
+        Count of rows inserted or replaced.
+    """
+    series_ids: list[str] = SEED_SERIES if mode == "seed" else SERIES_IDS
+    inserted: int = 0
+
+    for series_id in series_ids:
+        metadata_path: Path = _metadata_json_path(series_id)
+        if not metadata_path.exists():
+            logger.info(
+                "No metadata JSON for %s — skipping reference_docs load",
+                series_id,
+            )
+            continue
+
+        with metadata_path.open() as f:
+            metadata: dict = json.load(f)
+
+        fetched_at: str = metadata.get("fetched_at", "")
+
+        rows: list[tuple[str, str, str, str, str | None, str]] = []
+
+        notes: str = (metadata.get("series_notes") or "").strip()
+        if notes:
+            rows.append(
+                (
+                    series_id,
+                    "series_notes",
+                    f"FRED Series Notes — {series_id}",
+                    notes,
+                    f"https://fred.stlouisfed.org/series/{series_id}",
+                    fetched_at,
+                )
+            )
+
+        release_name: str = (metadata.get("release_name") or "").strip()
+        release_notes: str = (metadata.get("release_notes") or "").strip()
+        release_link: str | None = metadata.get("release_link") or None
+        release_content: str = release_notes or release_name
+        if release_content:
+            rows.append(
+                (
+                    series_id,
+                    "release_info",
+                    f"Release — {release_name}" if release_name else f"Release — {series_id}",
+                    release_content,
+                    release_link,
+                    fetched_at,
+                )
+            )
+
+        category_path: str = (metadata.get("category_path") or "").strip()
+        if category_path:
+            rows.append(
+                (
+                    series_id,
+                    "category_path",
+                    f"Category — {series_id}",
+                    category_path,
+                    None,
+                    fetched_at,
+                )
+            )
+
+        for row in rows:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO reference_docs (
+                    series_id, doc_type, title, content, source_url, fetched_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                row,
+            )
+            inserted += 1
+
+    conn.commit()
+    logger.info("Loaded %d reference_docs rows", inserted)
+    return inserted
+
+
 def _print_summary(conn: sqlite3.Connection, stats: dict[str, dict[str, int]]) -> None:
     """Print a summary of what was loaded into the database.
 
@@ -230,7 +364,7 @@ def _print_summary(conn: sqlite3.Connection, stats: dict[str, dict[str, int]]) -
     print("=" * 70)
 
     # Row counts per table
-    for table in ("series_metadata", "observations", "ai_insights"):
+    for table in ("series_metadata", "observations", "ai_insights", "reference_docs"):
         row: tuple = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()  # noqa: S608
         print(f"  {table:25s}  {row[0]:>8,} rows")
 
@@ -289,7 +423,9 @@ def build_database(mode: str = "seed") -> Path:
     conn: sqlite3.Connection = sqlite3.connect(db_path)
     try:
         _create_schema(conn)
+        _ensure_citations_column(conn)
         stats: dict[str, dict[str, int]] = _load_series(conn, series_ids, cutoff_date)
+        _load_reference_docs(conn, mode)
         _print_summary(conn, stats)
     finally:
         conn.close()

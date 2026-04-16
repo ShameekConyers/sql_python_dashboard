@@ -72,6 +72,27 @@ class TestOutputPath:
 
 
 # ---------------------------------------------------------------------------
+# _metadata_path
+# ---------------------------------------------------------------------------
+
+
+class TestMetadataPath:
+    """Tests for _metadata_path."""
+
+    def test_returns_metadata_json_path(self) -> None:
+        """Returns a path ending in data/raw/<series_id>_metadata.json."""
+        result: Path = data_pull._metadata_path("UNRATE")
+        assert result.name == "UNRATE_metadata.json"
+        assert result.parent == data_pull.RAW_DIR
+
+    def test_distinct_from_observation_path(self) -> None:
+        """Metadata path differs from the observations cache path."""
+        obs: Path = data_pull._output_path("UNRATE")
+        meta: Path = data_pull._metadata_path("UNRATE")
+        assert obs != meta
+
+
+# ---------------------------------------------------------------------------
 # _pull_series
 # ---------------------------------------------------------------------------
 
@@ -314,6 +335,284 @@ class TestPullSeriesList:
 
 
 # ---------------------------------------------------------------------------
+# _pull_series_metadata
+# ---------------------------------------------------------------------------
+
+
+def _make_mock_http_response(payload: dict) -> MagicMock:
+    """Build a mock httpx Response returning the given JSON payload.
+
+    Args:
+        payload: Dict to return from .json().
+
+    Returns:
+        A MagicMock configured to act like an httpx.Response.
+    """
+    response = MagicMock()
+    response.json.return_value = payload
+    response.raise_for_status.return_value = None
+    return response
+
+
+class TestPullSeriesMetadata:
+    """Tests for _pull_series_metadata."""
+
+    @patch("data_pull.time.sleep")
+    @patch("data_pull.httpx.Client")
+    def test_assembles_full_metadata_dict(
+        self,
+        mock_client_cls: MagicMock,
+        mock_sleep: MagicMock,
+    ) -> None:
+        """Combines series info + release + category into one dict."""
+        fred = MagicMock()
+        fred.get_series_info.return_value = {
+            "notes": "Measures unemployment...",
+            "title": "Unemployment Rate",
+            "units": "Percent",
+            "seasonal_adjustment": "Seasonally Adjusted",
+        }
+
+        client_instance = MagicMock()
+        # First .get() is release, second is leaf category, subsequent are parents.
+        client_instance.get.side_effect = [
+            _make_mock_http_response(
+                {
+                    "releases": [
+                        {
+                            "name": "Employment Situation",
+                            "link": "https://www.bls.gov/empsit",
+                            "notes": "Monthly BLS release.",
+                        }
+                    ]
+                }
+            ),
+            _make_mock_http_response(
+                {
+                    "categories": [
+                        {"id": 32, "name": "Unemployment Rate", "parent_id": 10}
+                    ]
+                }
+            ),
+            _make_mock_http_response(
+                {
+                    "categories": [
+                        {"id": 10, "name": "Labor Market", "parent_id": 0}
+                    ]
+                }
+            ),
+        ]
+        mock_client_cls.return_value.__enter__.return_value = client_instance
+
+        metadata: dict = data_pull._pull_series_metadata(
+            fred, "fake_key", "UNRATE"
+        )
+
+        assert metadata["series_id"] == "UNRATE"
+        assert metadata["series_notes"] == "Measures unemployment..."
+        assert metadata["title"] == "Unemployment Rate"
+        assert metadata["release_name"] == "Employment Situation"
+        assert metadata["release_link"] == "https://www.bls.gov/empsit"
+        # Walked parent: "Labor Market > Unemployment Rate"
+        assert metadata["category_path"] == "Labor Market > Unemployment Rate"
+        # fetched_at is set to an ISO timestamp
+        assert "T" in metadata["fetched_at"]
+
+    @patch("data_pull.time.sleep")
+    @patch("data_pull.httpx.Client")
+    def test_series_info_failure_is_non_fatal(
+        self,
+        mock_client_cls: MagicMock,
+        mock_sleep: MagicMock,
+    ) -> None:
+        """If get_series_info raises, the metadata dict still returns."""
+        fred = MagicMock()
+        fred.get_series_info.side_effect = Exception("API down")
+
+        client_instance = MagicMock()
+        client_instance.get.side_effect = [
+            _make_mock_http_response({"releases": []}),
+            _make_mock_http_response({"categories": []}),
+        ]
+        mock_client_cls.return_value.__enter__.return_value = client_instance
+
+        metadata: dict = data_pull._pull_series_metadata(
+            fred, "fake_key", "UNRATE"
+        )
+
+        assert metadata["series_id"] == "UNRATE"
+        assert metadata["series_notes"] == ""
+        assert metadata["release_name"] == ""
+        assert metadata["category_path"] == ""
+
+    @patch("data_pull.time.sleep")
+    @patch("data_pull.httpx.Client")
+    def test_release_failure_leaves_release_fields_blank(
+        self,
+        mock_client_cls: MagicMock,
+        mock_sleep: MagicMock,
+    ) -> None:
+        """Release HTTP failure does not prevent category fetch."""
+        fred = MagicMock()
+        fred.get_series_info.return_value = {
+            "notes": "notes",
+            "title": "t",
+            "units": "u",
+            "seasonal_adjustment": "sa",
+        }
+
+        client_instance = MagicMock()
+        # Release raises, category succeeds (leaf has no parent).
+        client_instance.get.side_effect = [
+            Exception("release down"),
+            _make_mock_http_response(
+                {"categories": [{"id": 1, "name": "Only", "parent_id": 0}]}
+            ),
+        ]
+        mock_client_cls.return_value.__enter__.return_value = client_instance
+
+        metadata: dict = data_pull._pull_series_metadata(
+            fred, "fake_key", "UNRATE"
+        )
+
+        assert metadata["release_name"] == ""
+        assert metadata["category_path"] == "Only"
+
+    @patch("data_pull.time.sleep")
+    @patch("data_pull.httpx.Client")
+    def test_no_categories_returns_empty_path(
+        self,
+        mock_client_cls: MagicMock,
+        mock_sleep: MagicMock,
+    ) -> None:
+        """When FRED returns no categories, category_path is blank."""
+        fred = MagicMock()
+        fred.get_series_info.return_value = {
+            "notes": "",
+            "title": "",
+            "units": "",
+            "seasonal_adjustment": "",
+        }
+
+        client_instance = MagicMock()
+        client_instance.get.side_effect = [
+            _make_mock_http_response({"releases": []}),
+            _make_mock_http_response({"categories": []}),
+        ]
+        mock_client_cls.return_value.__enter__.return_value = client_instance
+
+        metadata: dict = data_pull._pull_series_metadata(
+            fred, "fake_key", "UNRATE"
+        )
+
+        assert metadata["category_path"] == ""
+
+
+# ---------------------------------------------------------------------------
+# pull_metadata_list
+# ---------------------------------------------------------------------------
+
+
+class TestPullMetadataList:
+    """Tests for pull_metadata_list."""
+
+    @patch("data_pull.time.sleep")
+    @patch("data_pull._pull_series_metadata")
+    @patch("data_pull._load_api_key", return_value="fake_key")
+    @patch("data_pull.Fred")
+    def test_writes_metadata_json(
+        self,
+        mock_fred_cls: MagicMock,
+        mock_key: MagicMock,
+        mock_pull: MagicMock,
+        mock_sleep: MagicMock,
+        sample_series_info: dict,
+        tmp_path: Path,
+    ) -> None:
+        """Writes one metadata file per series."""
+        mock_pull.return_value = {
+            "series_id": "UNRATE",
+            "series_notes": "notes",
+            "title": "t",
+            "units": "u",
+            "seasonal_adjustment": "sa",
+            "release_name": "rn",
+            "release_link": "rl",
+            "release_notes": "rnotes",
+            "category_path": "A > B",
+            "fetched_at": "2026-04-16T00:00:00+00:00",
+        }
+
+        with patch.object(data_pull, "RAW_DIR", tmp_path):
+            data_pull.pull_metadata_list([sample_series_info])
+
+        out_file: Path = tmp_path / "UNRATE_metadata.json"
+        assert out_file.exists()
+        data: dict = json.loads(out_file.read_text())
+        assert data["series_id"] == "UNRATE"
+        assert data["category_path"] == "A > B"
+
+    @patch("data_pull.time.sleep")
+    @patch("data_pull._pull_series_metadata")
+    @patch("data_pull._load_api_key", return_value="fake_key")
+    @patch("data_pull.Fred")
+    def test_skips_cached_without_refresh(
+        self,
+        mock_fred_cls: MagicMock,
+        mock_key: MagicMock,
+        mock_pull: MagicMock,
+        mock_sleep: MagicMock,
+        sample_series_info: dict,
+        tmp_path: Path,
+    ) -> None:
+        """Cached metadata is not re-pulled unless refresh=True."""
+        cached: Path = tmp_path / "UNRATE_metadata.json"
+        cached.write_text('{"cached": true}')
+
+        with patch.object(data_pull, "RAW_DIR", tmp_path):
+            data_pull.pull_metadata_list([sample_series_info], refresh=False)
+
+        mock_pull.assert_not_called()
+        assert json.loads(cached.read_text()) == {"cached": True}
+
+    @patch("data_pull.time.sleep")
+    @patch("data_pull._pull_series_metadata")
+    @patch("data_pull._load_api_key", return_value="fake_key")
+    @patch("data_pull.Fred")
+    def test_continues_after_failure(
+        self,
+        mock_fred_cls: MagicMock,
+        mock_key: MagicMock,
+        mock_pull: MagicMock,
+        mock_sleep: MagicMock,
+        two_series_list: list[dict],
+        tmp_path: Path,
+    ) -> None:
+        """One series failing does not halt the metadata loop."""
+        mock_pull.side_effect = [
+            Exception("boom"),
+            {
+                "series_id": "GDPC1",
+                "series_notes": "",
+                "title": "",
+                "units": "",
+                "seasonal_adjustment": "",
+                "release_name": "",
+                "release_link": "",
+                "release_notes": "",
+                "category_path": "",
+                "fetched_at": "2026-04-16T00:00:00+00:00",
+            },
+        ]
+
+        with patch.object(data_pull, "RAW_DIR", tmp_path):
+            data_pull.pull_metadata_list(two_series_list)
+
+        assert not (tmp_path / "UNRATE_metadata.json").exists()
+        assert (tmp_path / "GDPC1_metadata.json").exists()
+
+
+# ---------------------------------------------------------------------------
 # main (integration-style with mocks)
 # ---------------------------------------------------------------------------
 
@@ -321,10 +620,14 @@ class TestPullSeriesList:
 class TestMain:
     """Tests for the main() entry point."""
 
+    @patch("data_pull.pull_metadata_list")
     @patch("data_pull.pull_series_list")
     @patch("data_pull._parse_args")
     def test_filters_to_single_series(
-        self, mock_args: MagicMock, mock_pull: MagicMock
+        self,
+        mock_args: MagicMock,
+        mock_pull: MagicMock,
+        mock_pull_meta: MagicMock,
     ) -> None:
         """--series flag filters to a single matching series."""
         mock_args.return_value = MagicMock(series="unrate", refresh=False)
@@ -333,11 +636,18 @@ class TestMain:
         called_list: list = mock_pull.call_args[0][0]
         assert len(called_list) == 1
         assert called_list[0]["id"] == "UNRATE"
+        # Metadata pull also receives the filtered list
+        meta_list: list = mock_pull_meta.call_args[0][0]
+        assert len(meta_list) == 1
 
+    @patch("data_pull.pull_metadata_list")
     @patch("data_pull.pull_series_list")
     @patch("data_pull._parse_args")
     def test_unknown_series_exits(
-        self, mock_args: MagicMock, mock_pull: MagicMock
+        self,
+        mock_args: MagicMock,
+        mock_pull: MagicMock,
+        mock_pull_meta: MagicMock,
     ) -> None:
         """Exits with code 1 when --series doesn't match any configured series."""
         mock_args.return_value = MagicMock(series="NOTREAL", refresh=False)
@@ -346,11 +656,16 @@ class TestMain:
             data_pull.main()
         assert exc_info.value.code == 1
         mock_pull.assert_not_called()
+        mock_pull_meta.assert_not_called()
 
+    @patch("data_pull.pull_metadata_list")
     @patch("data_pull.pull_series_list")
     @patch("data_pull._parse_args")
     def test_no_flags_pulls_all_series(
-        self, mock_args: MagicMock, mock_pull: MagicMock
+        self,
+        mock_args: MagicMock,
+        mock_pull: MagicMock,
+        mock_pull_meta: MagicMock,
     ) -> None:
         """Without --series, passes the full SERIES list."""
         mock_args.return_value = MagicMock(series=None, refresh=False)
@@ -358,14 +673,26 @@ class TestMain:
 
         called_list: list = mock_pull.call_args[0][0]
         assert len(called_list) == len(data_pull.SERIES)
+        mock_pull_meta.assert_called_once()
 
+    @patch("data_pull.pull_metadata_list")
     @patch("data_pull.pull_series_list")
     @patch("data_pull._parse_args")
     def test_refresh_flag_passed_through(
-        self, mock_args: MagicMock, mock_pull: MagicMock
+        self,
+        mock_args: MagicMock,
+        mock_pull: MagicMock,
+        mock_pull_meta: MagicMock,
     ) -> None:
-        """The --refresh flag is forwarded to pull_series_list."""
+        """The --refresh flag is forwarded to both pull functions."""
         mock_args.return_value = MagicMock(series=None, refresh=True)
         data_pull.main()
 
-        assert mock_pull.call_args[1]["refresh"] is True or mock_pull.call_args[0][1] is True
+        assert (
+            mock_pull.call_args[1].get("refresh") is True
+            or (len(mock_pull.call_args[0]) > 1 and mock_pull.call_args[0][1] is True)
+        )
+        assert (
+            mock_pull_meta.call_args[1].get("refresh") is True
+            or (len(mock_pull_meta.call_args[0]) > 1 and mock_pull_meta.call_args[0][1] is True)
+        )
