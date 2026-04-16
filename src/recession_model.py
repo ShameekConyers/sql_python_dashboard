@@ -57,7 +57,18 @@ FEATURE_COLUMNS: list[str] = [
     "info_trades_divergence",
     "info_employment_yoy",
     "power_output_yoy",
+    # Phase 14 — Hacker News tech-practitioner sentiment.
+    "hn_sentiment_3m_avg",
+    "hn_story_volume_yoy",
+    "layoff_story_freq",
 ]
+
+HN_FEATURE_COLUMNS: tuple[str, ...] = (
+    "hn_sentiment_3m_avg",
+    "hn_story_volume_yoy",
+    "layoff_story_freq",
+)
+"""Subset of ``FEATURE_COLUMNS`` sourced from ``hn_sentiment_monthly``."""
 
 TARGET_COLUMN: str = "recession_within_12m"
 
@@ -255,19 +266,132 @@ def _build_feature_matrix_from_conn(conn: sqlite3.Connection) -> pd.DataFrame:
     usrec["usrec_actual"] = usrec["usrec"].astype(int)
     usrec = usrec.drop(columns=["usrec"])
 
+    # --- HN sentiment features (Phase 14) ---
+    # hn_sentiment_monthly exists from 2022-01 onward. LEFT JOIN onto the
+    # all-months index so pre-window rows surface as NaN rather than
+    # dropping 5 years of training data.
+    hn = _build_hn_feature_frame(conn, all_months_index=t10y2y[["month"]])
+
     # --- Merge all features ---
-    frames = [t10y2y, unemp, gdp, cpi, emp, power, usrec]
+    frames = [t10y2y, unemp, gdp, cpi, emp, power, hn, usrec]
     merged = frames[0]
     for frame in frames[1:]:
         merged = merged.merge(frame, on="month", how="inner")
 
     merged = merged.set_index("month").sort_index()
 
+    # --- HN imputation: training-median fill for leading / sparse NaNs ---
+    # Pre-2022 rows and any mid-window gap in ``hn_sentiment_monthly``
+    # land here as NaN after the LEFT JOIN. We impute with the median
+    # computed over the training mask (``month <= TRAIN_CUTOFF``) only --
+    # a leak-free constant-impute that mirrors sklearn's
+    # ``SimpleImputer`` contract. YoY-shift leading NaNs get 0.0 because
+    # "no year-ago comparison" is neutral.
+    merged = _impute_hn_features(merged)
+
     # Drop rows where features aren't available (first 12 months have NaN
     # from 12-month lags)
     feature_cols = [c for c in FEATURE_COLUMNS if c in merged.columns]
     merged = merged.dropna(subset=feature_cols)
 
+    return merged
+
+
+def _build_hn_feature_frame(
+    conn: sqlite3.Connection,
+    all_months_index: pd.DataFrame,
+) -> pd.DataFrame:
+    """Build the HN feature frame indexed on ``month``.
+
+    Pulls ``hn_sentiment_monthly`` as-is, computes the three HN features
+    (3-month rolling mean sentiment, YoY story volume, layoff-story
+    share), and LEFT JOINs onto ``all_months_index`` so months without
+    HN coverage produce NaN rows. The caller handles imputation.
+
+    Args:
+        conn: Open SQLite connection.
+        all_months_index: DataFrame with a single ``month`` column
+            spanning the full feature-matrix window.
+
+    Returns:
+        DataFrame with columns ``month``, ``hn_sentiment_3m_avg``,
+        ``hn_story_volume_yoy``, ``layoff_story_freq``. Missing months
+        carry NaN across all three HN columns.
+    """
+    hn_query: str = """
+        SELECT
+            SUBSTR(month, 1, 7) AS month,
+            mean_sentiment,
+            story_count,
+            layoff_story_count
+        FROM hn_sentiment_monthly
+        ORDER BY month
+    """
+    hn = pd.read_sql_query(hn_query, conn)
+
+    if hn.empty:
+        # Empty HN table (dev DB or future coverage trim) -> all-NaN frame.
+        empty = all_months_index.copy()
+        for col in HN_FEATURE_COLUMNS:
+            empty[col] = np.nan
+        return empty
+
+    hn["hn_sentiment_3m_avg"] = (
+        hn["mean_sentiment"].rolling(3, min_periods=1).mean()
+    )
+    hn["hn_story_volume_yoy"] = (
+        hn["story_count"] / hn["story_count"].shift(12) - 1
+    )
+    # Guard division by zero defensively even though story_count > 0 is
+    # enforced by the aggregate's GROUP BY.
+    hn["layoff_story_freq"] = np.where(
+        hn["story_count"] > 0,
+        hn["layoff_story_count"] / hn["story_count"].replace(0, np.nan),
+        0.0,
+    )
+
+    hn = hn[["month", *HN_FEATURE_COLUMNS]]
+
+    # LEFT JOIN onto the full months index so pre-2022 / sparse months
+    # carry NaN (imputed later) rather than being dropped.
+    return all_months_index.merge(hn, on="month", how="left")
+
+
+def _impute_hn_features(merged: pd.DataFrame) -> pd.DataFrame:
+    """Fill HN-feature NaNs with training-period medians (leak-free).
+
+    ``hn_story_volume_yoy``'s first 12 in-window months carry NaN from
+    the YoY shift; those are filled with 0.0 (neutral "no year-ago
+    comparison"). Remaining NaNs -- pre-2022 rows and mid-window sparse
+    months -- are filled with the median computed over the training
+    mask (``month <= TRAIN_CUTOFF`` AND column is not NaN). Applying
+    the training-derived median to test rows is the standard
+    ``SimpleImputer`` contract: the imputer itself contains no test-set
+    information.
+
+    Args:
+        merged: Feature matrix indexed by month with HN feature columns
+            present (possibly with NaN leading/sparse rows).
+
+    Returns:
+        The same DataFrame with HN columns imputed. If an HN column is
+        entirely NaN in the training window (impossible with the
+        shipping seed), the fallback fill value is 0.0.
+    """
+    if "hn_story_volume_yoy" in merged.columns:
+        merged["hn_story_volume_yoy"] = merged["hn_story_volume_yoy"].fillna(
+            0.0
+        )
+
+    train_mask = merged.index <= TRAIN_CUTOFF
+    for col in HN_FEATURE_COLUMNS:
+        if col not in merged.columns:
+            continue
+        train_series = merged.loc[train_mask, col].dropna()
+        median_value: float = (
+            float(train_series.median()) if not train_series.empty else 0.0
+        )
+        merged[col] = merged[col].fillna(median_value)
     return merged
 
 

@@ -25,6 +25,9 @@ SCHEMA_SQL: str = (recession_model.SQL_DIR / "01_schema.sql").read_text()
 PREDICTION_SCHEMA_SQL: str = (
     recession_model.SQL_DIR / "04_prediction_schema.sql"
 ).read_text()
+HACKERNEWS_SCHEMA_SQL: str = (
+    recession_model.SQL_DIR / "07_hackernews_schema.sql"
+).read_text()
 
 # Series needed for feature matrix
 _SERIES_META: list[tuple[str, str, str, str]] = [
@@ -116,6 +119,31 @@ def _populate_synthetic_db(conn: sqlite3.Connection) -> None:
         usrec = 1.0 if in_recession else 0.0
         _insert_obs(conn, "USREC", date_str, usrec)
 
+    # HN aggregates: Phase 14 adds 3 classifier features sourced from
+    # ``hn_sentiment_monthly``. Real coverage starts 2022-01 (month_idx
+    # 61). Leave pre-window months unpopulated so the code's LEFT JOIN +
+    # training-median imputation is exercised end-to-end.
+    for month in months:
+        month_idx = (month.year - 2017) * 12 + month.month
+        if month_idx < 61:
+            continue
+        month_str = month.strftime("%Y-%m-01")
+        in_recession = (36 <= month_idx <= 38) or (90 <= month_idx <= 92)
+        mean_sent = -0.1 if in_recession else 0.05
+        mean_sent += float(rng.normal(0, 0.02))
+        story_count = 30 + int(rng.integers(-5, 6))
+        layoff_count = (
+            int(story_count * 0.4) if in_recession else int(story_count * 0.1)
+        )
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO hn_sentiment_monthly (
+                month, mean_sentiment, story_count, layoff_story_count
+            ) VALUES (?, ?, ?, ?)
+            """,
+            (month_str, mean_sent, story_count, layoff_count),
+        )
+
     conn.commit()
 
 
@@ -150,6 +178,7 @@ def mem_conn() -> sqlite3.Connection:
     """
     conn = sqlite3.connect(":memory:")
     conn.executescript(SCHEMA_SQL)
+    conn.executescript(HACKERNEWS_SCHEMA_SQL)
     _populate_synthetic_db(conn)
     return conn
 
@@ -191,7 +220,7 @@ class TestBuildFeatureMatrixColumns:
     def test_returns_expected_columns(
         self, feature_df: pd.DataFrame
     ) -> None:
-        """Feature matrix contains all 11 feature columns plus target."""
+        """Feature matrix contains all feature columns plus target."""
         for col in recession_model.FEATURE_COLUMNS:
             assert col in feature_df.columns, f"Missing column: {col}"
         assert recession_model.TARGET_COLUMN in feature_df.columns
@@ -498,6 +527,7 @@ class TestGeneratePredictions:
         conn = sqlite3.connect(str(db))
         conn.executescript(SCHEMA_SQL)
         conn.executescript(PREDICTION_SCHEMA_SQL)
+        conn.executescript(HACKERNEWS_SCHEMA_SQL)
         _populate_synthetic_db(conn)
         conn.close()
         return db
@@ -621,6 +651,7 @@ class TestGenerateScenarioGrid:
         conn.executescript(SCHEMA_SQL)
         conn.executescript(PREDICTION_SCHEMA_SQL)
         conn.executescript(SCENARIO_SCHEMA_SQL)
+        conn.executescript(HACKERNEWS_SCHEMA_SQL)
         _populate_synthetic_db(conn)
         conn.close()
         return db
@@ -641,3 +672,69 @@ class TestGenerateScenarioGrid:
             warnings.filterwarnings("ignore")
             df = recession_model.build_feature_matrix(db)
             return recession_model.train_models(df)
+
+
+# ---------------------------------------------------------------------------
+# HN classifier features (Phase 14)
+# ---------------------------------------------------------------------------
+
+
+class TestHnClassifierFeatures:
+    """Tests for the three HN-derived features added to FEATURE_COLUMNS."""
+
+    def test_feature_matrix_includes_hn_features(
+        self, feature_df: pd.DataFrame
+    ) -> None:
+        """All 3 HN feature columns are present in the feature matrix."""
+        for col in recession_model.HN_FEATURE_COLUMNS:
+            assert col in feature_df.columns, f"Missing HN column: {col}"
+            assert col in recession_model.FEATURE_COLUMNS
+
+    def test_hn_features_filled_for_pre_window_months(
+        self, feature_df: pd.DataFrame
+    ) -> None:
+        """Pre-2022 months get training-median imputation (non-NaN)."""
+        pre_window_months = [m for m in feature_df.index if m < "2022-01"]
+        assert pre_window_months, (
+            "Synthetic fixture should include pre-2022 months"
+        )
+        pre_window = feature_df.loc[pre_window_months]
+        for col in recession_model.HN_FEATURE_COLUMNS:
+            assert pre_window[col].isna().sum() == 0, (
+                f"Unexpected NaN in {col} pre-window after imputation"
+            )
+
+    def test_hn_features_handle_sparse_months(
+        self, mem_conn: sqlite3.Connection
+    ) -> None:
+        """A dropped mid-window HN row is tolerated via LEFT JOIN + impute."""
+        mem_conn.execute(
+            "DELETE FROM hn_sentiment_monthly WHERE month = '2023-06-01'"
+        )
+        mem_conn.commit()
+
+        df = recession_model._build_feature_matrix_from_conn(mem_conn)
+        assert "2023-06" in df.index, "Sparse month must still appear"
+        row = df.loc["2023-06"]
+        for col in recession_model.HN_FEATURE_COLUMNS:
+            assert not pd.isna(row[col]), (
+                f"Sparse-month NaN in {col} should be imputed"
+            )
+
+    def test_train_models_runs_with_14_features(
+        self, feature_df: pd.DataFrame
+    ) -> None:
+        """train_models runs end-to-end with the expanded 14-feature space."""
+        import warnings
+
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore")
+            results = recession_model.train_models(feature_df)
+
+        assert "logistic_regression" in results
+        assert "random_forest" in results
+        lr_keys = set(results["logistic_regression"]["feature_importance"])
+        rf_keys = set(results["random_forest"]["feature_importance"])
+        expected = set(recession_model.FEATURE_COLUMNS)
+        assert lr_keys == expected
+        assert rf_keys == expected
