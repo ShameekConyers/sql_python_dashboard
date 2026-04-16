@@ -3101,12 +3101,38 @@ def generate_insight(
         stripped_narrative, citation_records, citation_warnings = (
             _extract_citations(narrative, provided)
         )
+        # Validator counts only LLM-emitted citations; the auto-attached
+        # scholarly context below is for dashboard display, not RULE 7.
+        llm_citation_count: int = len(citation_records)
+        # Surface every retrieved scholarly chunk as a source on the
+        # dashboard, even when the LLM did not emit a [ref:N] tag for it.
+        # The "Show sources" panel lists these below the numerical claims
+        # so readers see the methodology references the narrative drew on.
+        cited_ids: set[int] = {r["ref_id"] for r in citation_records}
+        for doc_id, chunk in provided.items():
+            if doc_id in cited_ids:
+                continue
+            if not chunk.doc_type.startswith("scholarly"):
+                continue
+            excerpt: str = chunk.content.strip()
+            if len(excerpt) > 240:
+                excerpt = excerpt[:237].rstrip() + "..."
+            citation_records.append(
+                {
+                    "ref_id": doc_id,
+                    "doc_type": chunk.doc_type,
+                    "series_id": chunk.series_id,
+                    "title": chunk.title,
+                    "source_url": chunk.source_url,
+                    "excerpt": excerpt,
+                }
+            )
         warnings: list[str] = _validate_narrative(
             stripped_narrative,
             metric_key,
             citation_warnings=citation_warnings,
             retrieval_empty=retrieval_empty,
-            citation_count=len(citation_records),
+            citation_count=llm_citation_count,
         )
         _store_insight(
             conn, metric_key, slice_key, insight_type,

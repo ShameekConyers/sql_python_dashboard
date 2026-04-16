@@ -215,29 +215,33 @@ def retrieve(
         if min_scholarly <= 0:
             return chunks
 
-        scholarly_count: int = sum(
-            1 for c in chunks if c.doc_type.startswith("scholarly")
-        )
-        if scholarly_count >= min_scholarly:
+        # Count by unique doc_id because _build_reference_context dedupes
+        # to one entry per doc_id downstream. Multiple chunks of the same
+        # doc only count as one scholarly source for the floor.
+        scholarly_docs: set[int] = {
+            c.doc_id for c in chunks if c.doc_type.startswith("scholarly")
+        }
+        if len(scholarly_docs) >= min_scholarly:
             return chunks
 
-        # Pad with a scholarly-only, series-unfiltered query.
+        # Pad with a scholarly-only, series-unfiltered query. Ask for
+        # enough results to tolerate chunking duplicates.
         pool_result = collection.query(
             query_texts=[query],
-            n_results=min_scholarly * 3,
+            n_results=min_scholarly * 5,
             where={"doc_type": {"$nin": list(FRED_DOC_TYPES)}},
         )
         pool: list[RetrievedChunk] = _rows_from_query_result(pool_result)
 
         seen: set[int] = {c.doc_id for c in chunks}
         for c in pool:
-            if scholarly_count >= min_scholarly:
+            if len(scholarly_docs) >= min_scholarly:
                 break
             if c.doc_id in seen:
                 continue
             chunks.append(c)
             seen.add(c.doc_id)
-            scholarly_count += 1
+            scholarly_docs.add(c.doc_id)
 
         return chunks
     except Exception as e:
