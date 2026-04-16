@@ -926,3 +926,55 @@ class TestVerifyInsightWithCitations:
             db_with_refs, row_id=1, claims_json="[]", citations_json="not-json"
         )
         assert verification["citations"] == []
+
+
+# ---------------------------------------------------------------------------
+# HN reference citation verification (Phase 14)
+# ---------------------------------------------------------------------------
+
+
+class TestVerifyHnCitation:
+    """Social reference_docs rows pass through the same path as FRED refs."""
+
+    def test_verifies_hn_ref_id_through_reference_docs(
+        self, db_with_refs: sqlite3.Connection
+    ) -> None:
+        """An HN social reference_docs row verifies through _verify_citations."""
+        # Seed a USINFO metadata row so the FK allows inserting under that series.
+        db_with_refs.execute(
+            "INSERT OR IGNORE INTO series_metadata "
+            "(series_id, name, category, frequency, units) "
+            "VALUES (?, ?, ?, ?, ?)",
+            ("USINFO", "Info Sector", "ai_labor", "monthly", "Thousands"),
+        )
+        db_with_refs.execute(
+            "INSERT INTO reference_docs "
+            "(id, series_id, doc_type, title, content, source_url, fetched_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                5001,
+                "USINFO",
+                "social:hn:8888888",
+                "Tech layoffs at BigCo",
+                "Tech layoffs at BigCo: details in the filing.",
+                "https://news.ycombinator.com/item?id=8888888",
+                "2024-06-01T00:00:00+00:00",
+            ),
+        )
+        db_with_refs.commit()
+
+        citations: list[dict[str, Any]] = [
+            {
+                "ref_id": 5001,
+                "doc_type": "social:hn:8888888",
+                "series_id": "USINFO",
+                "title": "Tech layoffs at BigCo",
+                "source_url": "https://news.ycombinator.com/item?id=8888888",
+                "excerpt": "Tech layoffs at BigCo",
+            }
+        ]
+
+        results = verify_insights._verify_citations(db_with_refs, citations)
+        assert len(results) == 1
+        assert results[0]["ref_exists"] is True
+        assert results[0]["excerpt_matches"] is True

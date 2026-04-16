@@ -19,6 +19,12 @@ import ai_insights
 SCHEMA_SQL: str = (
     ai_insights.PROJECT_ROOT / "sql" / "01_schema.sql"
 ).read_text()
+HACKERNEWS_SCHEMA_SQL: str = (
+    ai_insights.PROJECT_ROOT / "sql" / "07_hackernews_schema.sql"
+).read_text()
+REFERENCE_SCHEMA_SQL: str = (
+    ai_insights.PROJECT_ROOT / "sql" / "06_reference_schema.sql"
+).read_text()
 
 # ---------------------------------------------------------------------------
 # Test data helpers
@@ -52,6 +58,8 @@ def _make_test_db() -> sqlite3.Connection:
     """
     conn: sqlite3.Connection = sqlite3.connect(":memory:")
     conn.executescript(SCHEMA_SQL)
+    conn.executescript(HACKERNEWS_SCHEMA_SQL)
+    conn.executescript(REFERENCE_SCHEMA_SQL)
 
     for meta in SERIES_META:
         conn.execute(
@@ -186,6 +194,17 @@ def _make_test_db() -> sqlite3.Connection:
         "(series_id, date, value, value_covid_adjusted) "
         "VALUES ('CES2023800001', '2020-02-01', 1780, 1780)"
     )
+
+    # HN sentiment: seed the same 24 months so the Phase 14 slice has
+    # current + prior 12-month windows to aggregate.
+    for i, d in enumerate(months):
+        sentiment: float = -0.1 if i >= 12 else 0.0
+        conn.execute(
+            "INSERT INTO hn_sentiment_monthly "
+            "(month, mean_sentiment, story_count, layoff_story_count) "
+            "VALUES (?, ?, ?, ?)",
+            (d, sentiment, 30, 6 if i >= 12 else 2),
+        )
 
     conn.commit()
     return conn
@@ -1056,3 +1075,138 @@ class TestGenerateInsightRagWiring:
         )
 
         assert mock_retrieve.call_args.kwargs["series_hint"] is None
+
+
+# ---------------------------------------------------------------------------
+# HN labor sentiment slice (Phase 14)
+# ---------------------------------------------------------------------------
+
+
+class TestHnLaborSentiment:
+    """Tests for the Phase 14 HN labor sentiment slice."""
+
+    def test_composite_metric_hints_routes_hn_to_usinfo(self) -> None:
+        """``hn_labor_sentiment`` resolves to ``USINFO`` via hints, not cross-series."""
+        assert ai_insights._COMPOSITE_METRIC_HINTS["hn_labor_sentiment"] == "USINFO"
+        assert (
+            ai_insights._series_hint_for_metric("hn_labor_sentiment") == "USINFO"
+        )
+        assert "hn_labor_sentiment" not in ai_insights._CROSS_SERIES_METRICS
+
+    def test_hn_labor_sentiment_slice_in_insight_slices(self) -> None:
+        """The new slice appears in INSIGHT_SLICES."""
+        keys: list[str] = [s["metric_key"] for s in ai_insights.INSIGHT_SLICES]
+        assert "hn_labor_sentiment" in keys
+
+    def test_context_hn_labor_sentiment_returns_required_keys(
+        self, test_db: sqlite3.Connection
+    ) -> None:
+        """Context builder returns the expected dict shape."""
+        ctx: dict[str, Any] = ai_insights._context_hn_labor_sentiment(test_db)
+        assert "context_text" in ctx
+        assert "data_points" in ctx
+        dp: dict[str, Any] = ctx["data_points"]
+        assert dp, "data_points should not be empty with the test fixture"
+        for key in (
+            "latest_month",
+            "window_start",
+            "hn_sentiment_current_12m",
+            "hn_sentiment_prior_12m",
+            "hn_sentiment_change",
+            "hn_total_stories",
+            "usinfo_change_pct",
+            "usinfo_change_raw_pct",
+        ):
+            assert key in dp, f"Missing data_point key: {key}"
+
+    def test_claims_hn_labor_sentiment_uses_existing_verifier_types(
+        self, test_db: sqlite3.Connection
+    ) -> None:
+        """Every claim uses an aggregation in the existing verifier registry."""
+        import verify_insights
+
+        valid_aggs: set[str] = set(verify_insights.VERIFIERS.keys())
+        claims: list[dict[str, Any]] = ai_insights._claims_hn_labor_sentiment(
+            test_db
+        )
+        assert len(claims) > 0
+        for claim in claims:
+            assert claim["aggregation"] in valid_aggs, (
+                f"Unknown aggregation type: {claim['aggregation']}"
+            )
+
+    def test_usinfo_analysis_prompt_mentions_hacker_news(self) -> None:
+        """Four updated AI-labor slices mention Hacker News in their prompt."""
+        target_keys: set[str] = {
+            "USINFO_CES2023800001",
+            "deep_divergence",
+            "synthesis",
+            "deep_synthesis_charts",
+        }
+        for s in ai_insights.INSIGHT_SLICES:
+            if s["metric_key"] in target_keys:
+                assert "Hacker News" in s["analysis_prompt"] or \
+                       "Hacker\nNews" in s["analysis_prompt"], (
+                    f"Slice {s['metric_key']} missing HN invite in prompt"
+                )
+
+    @patch("ai_insights._call_llm")
+    @patch("ai_insights.rag_retrieval.retrieve")
+    def test_generate_insight_for_hn_labor_sentiment_with_stubs(
+        self,
+        mock_retrieve: MagicMock,
+        mock_llm: MagicMock,
+        test_db: sqlite3.Connection,
+    ) -> None:
+        """End-to-end with stubbed retrieval + LLM produces an HN citation."""
+        import rag_retrieval as rr
+
+        # Seed a social reference_docs row that the citation extractor will find.
+        test_db.execute(
+            "INSERT INTO reference_docs "
+            "(id, series_id, doc_type, title, content, source_url, fetched_at) "
+            "VALUES (9001, 'USINFO', 'social:hn:99999999', "
+            "'AI layoffs accelerate at BigCo', "
+            "'AI layoffs accelerate at BigCo', "
+            "'https://news.ycombinator.com/item?id=99999999', "
+            "'2024-03-01T00:00:00+00:00')"
+        )
+        test_db.commit()
+
+        fake_chunk = rr.RetrievedChunk(
+            doc_id=9001,
+            series_id="USINFO",
+            doc_type="social:hn:99999999",
+            title="AI layoffs accelerate at BigCo",
+            content="AI layoffs accelerate at BigCo",
+            source_url="https://news.ycombinator.com/item?id=99999999",
+            score=0.2,
+        )
+        mock_retrieve.return_value = [fake_chunk]
+        mock_llm.return_value = (
+            "HN tech-practitioner sentiment has declined by 0.10 points "
+            "over the trailing 12 months, coinciding with a decline in "
+            "info-sector employment. This trend tracks alongside broader "
+            "AI hiring shifts [ref:9001]."
+        )
+
+        slice_config: dict[str, Any] = {
+            "metric_key": "hn_labor_sentiment",
+            "insight_type": "correlation",
+            "context_fn": ai_insights._context_hn_labor_sentiment,
+            "claims_fn": ai_insights._claims_hn_labor_sentiment,
+            "analysis_prompt": "Describe HN sentiment.",
+        }
+
+        ai_insights.generate_insight(
+            test_db, "llama3.1:8b", slice_config, "2023-2024"
+        )
+
+        row = test_db.execute(
+            "SELECT citations_json FROM ai_insights "
+            "WHERE metric_key = 'hn_labor_sentiment'"
+        ).fetchone()
+        assert row is not None
+        citations: list[dict[str, Any]] = json.loads(row[0])
+        assert len(citations) >= 1
+        assert citations[0]["ref_id"] == 9001

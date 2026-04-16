@@ -2379,6 +2379,289 @@ def _context_deep_synthesis_charts(
     }
 
 
+_HN_SLICE_WINDOW_MONTHS: int = 12
+"""Trailing window length for the HN labor sentiment slice."""
+
+
+def _hn_latest_complete_month(conn: sqlite3.Connection) -> str | None:
+    """Return the most recent complete YYYY-MM in ``hn_sentiment_monthly``.
+
+    Masks the row whose month equals today's year-month (partial-month
+    data skews sentiment) and returns ``None`` when no complete rows
+    exist.
+
+    Args:
+        conn: SQLite database connection.
+
+    Returns:
+        A YYYY-MM string, or None when ``hn_sentiment_monthly`` is
+        empty or contains only the current partial month.
+    """
+    rows: list[tuple[str]] = conn.execute(
+        "SELECT SUBSTR(month, 1, 7) FROM hn_sentiment_monthly "
+        "ORDER BY month DESC LIMIT 2"
+    ).fetchall()
+    if not rows:
+        return None
+    today_ym: str = datetime.now(timezone.utc).strftime("%Y-%m")
+    first: str = rows[0][0]
+    if first == today_ym:
+        if len(rows) < 2:
+            return None
+        return rows[1][0]
+    return first
+
+
+def _hn_window_average(
+    conn: sqlite3.Connection,
+    period_start: str,
+    period_end: str,
+) -> float | None:
+    """Return the mean ``mean_sentiment`` for months in [start, end] inclusive.
+
+    Args:
+        conn: SQLite database connection.
+        period_start: Inclusive lower bound YYYY-MM.
+        period_end: Inclusive upper bound YYYY-MM.
+
+    Returns:
+        Arithmetic mean of ``mean_sentiment`` over matching rows, or
+        None when no rows fall in the window.
+    """
+    row: tuple | None = conn.execute(
+        "SELECT AVG(mean_sentiment) FROM hn_sentiment_monthly "
+        "WHERE SUBSTR(month, 1, 7) BETWEEN ? AND ?",
+        (period_start, period_end),
+    ).fetchone()
+    return float(row[0]) if row and row[0] is not None else None
+
+
+def _hn_window_story_totals(
+    conn: sqlite3.Connection,
+    period_start: str,
+    period_end: str,
+) -> tuple[int, int]:
+    """Return (total_stories, total_layoff_stories) summed over the window.
+
+    Args:
+        conn: SQLite database connection.
+        period_start: Inclusive lower bound YYYY-MM.
+        period_end: Inclusive upper bound YYYY-MM.
+
+    Returns:
+        Tuple of ``(story_count_sum, layoff_count_sum)``. Both are 0
+        when no rows fall in the window.
+    """
+    row: tuple | None = conn.execute(
+        "SELECT COALESCE(SUM(story_count), 0), "
+        "       COALESCE(SUM(layoff_story_count), 0) "
+        "FROM hn_sentiment_monthly "
+        "WHERE SUBSTR(month, 1, 7) BETWEEN ? AND ?",
+        (period_start, period_end),
+    ).fetchone()
+    if not row:
+        return (0, 0)
+    return (int(row[0]), int(row[1]))
+
+
+def _context_hn_labor_sentiment(conn: sqlite3.Connection) -> dict[str, Any]:
+    """Build the LLM context block for the HN labor sentiment slice.
+
+    Aggregates a trailing 12-month HN sentiment window (masking the
+    partial current month) against the prior 12-month window and the
+    matching USINFO per-capita movement. When
+    ``hn_sentiment_monthly`` has fewer than one complete month the
+    slice returns an empty-claims context so downstream generation
+    still produces a storable (if uninteresting) insight row.
+
+    Args:
+        conn: SQLite database connection.
+
+    Returns:
+        Dict with ``context_text`` (string for the LLM) and
+        ``data_points`` (dict consumed by the claims builder). When
+        data is missing ``data_points`` is ``{}``.
+    """
+    latest_month: str | None = _hn_latest_complete_month(conn)
+    if latest_month is None:
+        return {
+            "context_text": (
+                "HN Labor Sentiment: no complete months of HN sentiment "
+                "data available. Skipping this slice."
+            ),
+            "data_points": {},
+        }
+
+    window_start: str = _month_offset(
+        latest_month, -(_HN_SLICE_WINDOW_MONTHS - 1)
+    )
+    prior_end: str = _month_offset(window_start, -1)
+    prior_start: str = _month_offset(
+        prior_end, -(_HN_SLICE_WINDOW_MONTHS - 1)
+    )
+
+    sent_current: float | None = _hn_window_average(
+        conn, window_start, latest_month
+    )
+    sent_prior: float | None = _hn_window_average(
+        conn, prior_start, prior_end
+    )
+    sent_change: float | None = (
+        sent_current - sent_prior
+        if sent_current is not None and sent_prior is not None
+        else None
+    )
+
+    total_stories, layoff_stories = _hn_window_story_totals(
+        conn, window_start, latest_month
+    )
+    layoff_share: float = (
+        layoff_stories / total_stories if total_stories else 0.0
+    )
+
+    usinfo_change: float = _compute_change(
+        conn, "USINFO", window_start, latest_month,
+        per_capita=True,
+    )
+    usinfo_change_raw: float = _compute_change(
+        conn, "USINFO", window_start, latest_month,
+    )
+
+    sent_current_str: str = (
+        f"{sent_current:+.3f}" if sent_current is not None else "n/a"
+    )
+    sent_prior_str: str = (
+        f"{sent_prior:+.3f}" if sent_prior is not None else "n/a"
+    )
+    sent_change_str: str = (
+        f"{sent_change:+.3f}" if sent_change is not None else "n/a"
+    )
+
+    context_text: str = (
+        f"HN Labor Sentiment (trailing {_HN_SLICE_WINDOW_MONTHS} months "
+        f"ending {latest_month}):\n"
+        f"- HN mean sentiment (current 12m): {sent_current_str} "
+        f"(compound score in [-1, 1])\n"
+        f"- HN mean sentiment (prior 12m):   {sent_prior_str}\n"
+        f"- HN sentiment change:              {sent_change_str} "
+        "(raw point change; report as a point change, not pp or %)\n"
+        f"- HN stories in window:             {total_stories:,} "
+        f"(layoff-tagged: {layoff_stories:,}, share "
+        f"{layoff_share:.1%})\n"
+        f"- USINFO per-capita change over window: "
+        f"{usinfo_change:+.2f}% "
+        "(per-capita EMPLOYMENT index; describe as percent change "
+        "from a 100 baseline)\n"
+        f"- USINFO raw level change over window:  "
+        f"{usinfo_change_raw:+.2f}%\n"
+        "Use 'coincides with' or 'tracks alongside'; the data does not "
+        "establish causation."
+    )
+
+    return {
+        "context_text": context_text,
+        "data_points": {
+            "latest_month": latest_month,
+            "window_start": window_start,
+            "prior_start": prior_start,
+            "prior_end": prior_end,
+            "hn_sentiment_current_12m": (
+                round(sent_current, 3) if sent_current is not None else None
+            ),
+            "hn_sentiment_prior_12m": (
+                round(sent_prior, 3) if sent_prior is not None else None
+            ),
+            "hn_sentiment_change": (
+                round(sent_change, 3) if sent_change is not None else None
+            ),
+            "hn_total_stories": total_stories,
+            "hn_layoff_stories": layoff_stories,
+            "hn_layoff_share": round(layoff_share, 3),
+            "usinfo_change_pct": round(usinfo_change, 2),
+            "usinfo_change_raw_pct": round(usinfo_change_raw, 2),
+        },
+    }
+
+
+def _claims_hn_labor_sentiment(
+    conn: sqlite3.Connection,
+) -> list[dict[str, Any]]:
+    """Build verifiable claims for the HN labor sentiment slice.
+
+    All claims reuse existing verifier aggregations (``change_pct``,
+    ``latest``) so no new verifier type is needed. The HN sentiment
+    narrative is woven around FRED-anchored numeric claims. When the
+    HN window cannot be formed the claims list is empty, matching the
+    empty-claims guard in the context function.
+
+    Args:
+        conn: SQLite database connection.
+
+    Returns:
+        List of structured claim dicts.
+    """
+    ctx: dict[str, Any] = _context_hn_labor_sentiment(conn)
+    data: dict[str, Any] = ctx["data_points"]
+    if not data:
+        return []
+
+    window_start: str = data["window_start"]
+    latest_month: str = data["latest_month"]
+    usinfo_change_raw: float = float(data["usinfo_change_raw_pct"])
+
+    # USINFO's latest observation can lag HN coverage by one or two
+    # months (HN is daily; BLS employment is monthly). Anchor the
+    # 'latest' claim at USINFO's own latest so the verifier's
+    # single-month lookup finds a row.
+    usinfo_anchor: str = _latest_month(conn, "USINFO")
+    usinfo_latest_val: float | None = _boundary_value(
+        conn, "USINFO", usinfo_anchor, usinfo_anchor, position="end",
+    )
+    usinfo_latest: float = (
+        round(usinfo_latest_val, 2) if usinfo_latest_val is not None else 0.0
+    )
+
+    ipg_change_raw: float = _compute_change(
+        conn, "IPG2211S", window_start, latest_month,
+    )
+
+    return [
+        _make_claim(
+            (
+                f"USINFO changed {usinfo_change_raw:+.2f}% between "
+                f"{window_start} and {latest_month}"
+            ),
+            "USINFO",
+            usinfo_change_raw,
+            "value",
+            "change_pct",
+            window_start,
+            latest_month,
+        ),
+        _make_claim(
+            (
+                f"Electric power (IPG2211S) changed "
+                f"{ipg_change_raw:+.2f}% over the same window"
+            ),
+            "IPG2211S",
+            ipg_change_raw,
+            "value",
+            "change_pct",
+            window_start,
+            latest_month,
+        ),
+        _make_claim(
+            f"USINFO latest reading: {usinfo_latest:.2f}",
+            "USINFO",
+            usinfo_latest,
+            "value",
+            "latest",
+            usinfo_anchor,
+            usinfo_anchor,
+        ),
+    ]
+
+
 def _context_synthesis(conn: sqlite3.Connection) -> dict[str, Any]:
     """Build cross-metric synthesis context for the deep dive insight.
 
@@ -2532,7 +2815,11 @@ INSIGHT_SLICES: list[dict[str, Any]] = [
             "Do not repeat the full-range trend. What changed "
             "after Nov 2022? The series are per-capita EMPLOYMENT "
             "indexes, not productivity or output. Use 'employment' "
-            "explicitly."
+            "explicitly. If REFERENCE CONTEXT contains a Hacker "
+            "News story whose title is relevant to AI hiring, "
+            "layoffs, or the info-sector labor market, cite it "
+            "via [ref:N] when its sentiment direction is consistent "
+            "with the data."
         ),
     },
     {
@@ -2563,7 +2850,11 @@ INSIGHT_SLICES: list[dict[str, Any]] = [
             "The info and trades series are EMPLOYMENT indexes; "
             "never call them 'output,' 'productivity,' or "
             "'activity.' Only IPG2211S is an output (power "
-            "production) index."
+            "production) index. If REFERENCE CONTEXT contains a "
+            "Hacker News story whose title is relevant to AI "
+            "hiring, layoffs, or the info-sector labor market, "
+            "cite it via [ref:N] when its sentiment direction is "
+            "consistent with the data."
         ),
     },
     {
@@ -2616,7 +2907,11 @@ INSIGHT_SLICES: list[dict[str, Any]] = [
             "AI's impact on the labor market? These are per-capita "
             "EMPLOYMENT indexes. Do not call them productivity, "
             "output, or activity. Describe the relationship with "
-            "'coincides with.'"
+            "'coincides with.' If REFERENCE CONTEXT contains a "
+            "Hacker News story whose title is relevant to AI "
+            "hiring, layoffs, or the info-sector labor market, "
+            "cite it via [ref:N] when its sentiment direction is "
+            "consistent with the data."
         ),
     },
     {
@@ -2677,7 +2972,35 @@ INSIGHT_SLICES: list[dict[str, Any]] = [
             "impact. Describe any recession risk score as a 0-1 "
             "reading. Use correlation language ('coincides with,' "
             "'tracks alongside') for multi-series relationships. No "
-            "causal verbs."
+            "causal verbs. If REFERENCE CONTEXT contains a Hacker "
+            "News story whose title is relevant to AI hiring, "
+            "layoffs, or the info-sector labor market, cite it via "
+            "[ref:N] when its sentiment direction is consistent "
+            "with the data."
+        ),
+    },
+    {
+        "metric_key": "hn_labor_sentiment",
+        "insight_type": "correlation",
+        "context_fn": _context_hn_labor_sentiment,
+        "claims_fn": _claims_hn_labor_sentiment,
+        "analysis_prompt": (
+            "Describe how Hacker News tech-practitioner sentiment "
+            "tracks alongside info-sector employment over the "
+            "post-ChatGPT period. Sentiment is a compound score in "
+            "[-1, 1] from a transformer model on HN story titles "
+            "and excerpts; treat it as a signal from a "
+            "self-selected audience of tech practitioners, not a "
+            "representative labor-market sentiment measure. Report "
+            "sentiment changes as raw point changes (e.g., '-0.10' "
+            "rather than 'pp' or '%'). USINFO is a per-capita "
+            "employment INDEX; describe its changes as percent "
+            "changes from a 100 baseline. Use 'coincides with' or "
+            "'tracks alongside'; the data does not establish "
+            "causation. If REFERENCE CONTEXT includes one or more "
+            "Hacker News stories, cite at least one via [ref:N] "
+            "when its title matches the sentiment trend you "
+            "describe."
         ),
     },
 ]
@@ -2912,6 +3235,10 @@ _COMPOSITE_METRIC_HINTS: dict[str, str] = {
     "USINFO_CES2023800001": "USINFO",
     "IPG2211S_USINFO": "IPG2211S",
     "U6_U3": "U6RATE",
+    # Phase 14: HN slice routes through the USINFO filter so retrieval
+    # surfaces the ``social:hn:<id>`` rows (stored under series_id='USINFO')
+    # alongside the three FRED USINFO rows.
+    "hn_labor_sentiment": "USINFO",
 }
 
 
