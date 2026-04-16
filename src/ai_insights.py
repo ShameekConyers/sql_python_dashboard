@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import re
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
@@ -38,14 +39,128 @@ OLLAMA_BASE_URL: str = "http://localhost:11434"
 CHATGPT_LAUNCH: str = "2022-11"
 """Year-month of ChatGPT public release, used as an analytical anchor point."""
 
+SERIES_KIND: dict[str, str] = {
+    # Rate-type series — report changes in percentage points
+    "UNRATE": "rate",
+    "U6RATE": "rate",
+    "T10Y2Y": "rate",
+    "CPIAUCSL_YOY": "rate",  # virtual key for CPI YoY framing
+    # Level-type series — report changes as percent
+    "GDPC1": "level",
+    "CPIAUCSL": "level",
+    "USINFO": "level",
+    "CES2023800001": "level",
+    "IPG2211S": "level",
+    "CNP16OV": "level",
+    "USREC": "level",  # binary, never meaningfully report changes
+}
+"""Classification of every FRED series into rate vs level.
+
+Rate-type series are percentages (unemployment, yield spread, CPI YoY) and
+period-over-period changes should be reported in percentage points. Level-type
+series are dollar values or indexes where percent change is the natural unit.
+"""
+
+SIGNAL_RULES: list[dict[str, Any]] = [
+    {"feature": "yield_spread", "condition": "lt", "threshold": 0},
+    {"feature": "yield_inverted_months", "condition": "gt", "threshold": 0},
+    {"feature": "unrate_12m_change", "condition": "gt", "threshold": 0},
+    {"feature": "gdp_growth_annualized", "condition": "lt", "threshold": 0},
+    {"feature": "info_employment_yoy", "condition": "lt", "threshold": 0},
+]
+"""Heuristic thresholds that classify recession-feature values as RED.
+
+Shared by _claims_feature_snapshot() (which counts red features) and
+_context_feature_snapshot() (which labels each feature RED/GREEN/NEUTRAL in
+the LLM context string).
+"""
+
+NARRATIVE_PATTERNS: list[tuple[str, str]] = [
+    # Category 3 — probability language applied to recession risk score
+    (
+        r"(?i)\b\d+(?:\.\d+)?\s*%\s+(?:likelihood|chance|probability)\b",
+        "Describe recession scores as a 0-1 reading, not a probability.",
+    ),
+    (
+        r"(?i)\blikelihood of (?:a )?recession\b",
+        "Do not describe recession score as a likelihood.",
+    ),
+    (
+        r"(?i)\bprobability of (?:a )?recession\b",
+        "Do not describe recession score as a probability.",
+    ),
+    # Category 1 — wrong terminology (productivity vs employment)
+    (
+        r"(?i)\bdecline in productivity\b|\bproductivity decline\b",
+        "Use 'employment' not 'productivity' for labor series.",
+    ),
+    (
+        r"(?i)per-capita (?:output|activity)\b",
+        "Use 'per-capita employment index' not 'per-capita output/activity'.",
+    ),
+    # Category 6 — causal verbs
+    (
+        r"(?i)\b(?:is|are)\s+(?:causing|driving|displacing)\b",
+        "Use 'coincides with' or 'tracks alongside' instead of causal verbs.",
+    ),
+    (
+        r"(?i)\b(?:is|are)\s+responsible for\b",
+        "Do not assert causation.",
+    ),
+    # Category 2 — hallucinated dollar-billion expansions from GDP level
+    (
+        r"(?i)(?:quarterly|annualized|annual|monthly)\s+"
+        r"(?:expansion|growth|increase|gain)\s+of\s+\$\d",
+        "Dollar figures from GDP claims are levels, not expansions.",
+    ),
+    (
+        r"(?i)\$\d[\d,]*\s*B?\s+(?:expansion|gain|increase)",
+        "Do not describe dollar level amounts as expansions or gains.",
+    ),
+]
+"""Regex anti-patterns flagged after narrative generation.
+
+Each tuple is (pattern, human-readable message). Warnings are logged; storage
+is never blocked. Operators judge whether to regenerate flagged slices.
+"""
+
 SYSTEM_PROMPT: str = """\
 You are an economic analyst writing insights for a macro economic dashboard \
 that tracks recession indicators, AI's impact on the labor market, and energy \
 production.
 
 Write a 2-3 sentence analyst-quality narrative paragraph. Be specific, \
-reference the numbers from the key findings, and avoid hedging. Write as if \
+reference the numbers from KEY FINDINGS, and avoid hedging. Write as if \
 briefing a portfolio manager.
+
+RULES:
+1. NUMBERS. Only reference numbers that appear in KEY FINDINGS or DATA \
+CONTEXT. Do not invent, extrapolate, or round figures beyond what is \
+provided. Dollar values labeled "level" are levels, not changes or \
+expansions.
+2. TERMINOLOGY. Use the exact labels from the context. Employment is \
+"employment," not "productivity" or "output." An index is an "index," not a \
+"level" or "rate" unless explicitly labeled as such.
+3. UNITS. For rate-type series (unemployment rate, U6, yield spread, CPI \
+YoY), describe changes in percentage points (e.g., "+0.1pp") when the \
+context provides a pp framing. For levels and indexes (GDP, CPI level, \
+employment counts, indexes), describe changes as percent changes. Follow \
+the unit cue in the context string. Unit directives that appear after an \
+em-dash (e.g. "— report in pp") are instructions to you — do NOT repeat \
+them in the narrative; just follow the unit.
+4. MODEL OUTPUTS. The recession risk score is a 0-1 value indicating \
+resemblance to historical pre-recession periods. Do NOT call it a \
+"probability," "likelihood," "chance," or "percent chance." Refer to it as \
+a "score," "reading," or "risk score."
+5. CAUSATION. Use "coincides with," "is consistent with," "tracks \
+alongside," or "suggests" when interpreting correlations. Do NOT use \
+"causes," "drives," "displaces," "is responsible for," or similar \
+definitive causal verbs. The dashboard explores a thesis; it does not \
+prove it.
+6. SCALES. Do not subtract or compare numbers on different scales (e.g. a \
+per-capita employment index and a power output index). If the context \
+provides a precomputed gap, reference it as given; do not compute a new \
+gap in the narrative.
 
 Return ONLY the narrative text. No JSON, no markdown, no bullet points, \
 no preamble like "Here is...". Just the paragraph.
@@ -274,6 +389,48 @@ def _compute_pct_of_start(
     return round(end_val / start_val * 100, 2)
 
 
+def _fmt_change(
+    series_id: str,
+    start_val: float,
+    end_val: float,
+) -> str:
+    """Format a period change with explicit units and a unit cue.
+
+    Rate-type series (per SERIES_KIND) report absolute percentage-point
+    change first with the relative percent change in parentheses. Level-type
+    series report the percent change first with the absolute delta in
+    parentheses. The returned string ends with an em-dash hint ("— report in
+    pp" or "— report as percent change") so the LLM follows the system-prompt
+    unit rule rather than guessing. The system prompt tells the model not to
+    echo the hint in the narrative.
+
+    Args:
+        series_id: FRED series ID (or 'CPIAUCSL_YOY' for CPI YoY framing).
+        start_val: Starting value.
+        end_val: Ending value.
+
+    Returns:
+        Formatted change string for inclusion in a context_text block.
+
+    Raises:
+        KeyError: If the series is not registered in SERIES_KIND.
+    """
+    kind: str = SERIES_KIND[series_id]
+    pp: float = end_val - start_val
+    rel: float = (
+        (end_val - start_val) / start_val * 100 if start_val else 0.0
+    )
+    if kind == "rate":
+        return (
+            f"{pp:+.2f}pp (from {start_val:.2f} to {end_val:.2f}; "
+            f"relative {rel:+.2f}%) — report in pp"
+        )
+    return (
+        f"{rel:+.2f}% (from {start_val:.2f} to {end_val:.2f}; "
+        f"absolute delta {pp:+.2f}) — report as percent change"
+    )
+
+
 def _make_claim(
     description: str,
     metric: str,
@@ -429,8 +586,8 @@ def _claims_gdp_trend(
             yr_ago, latest,
         ),
         _make_claim(
-            f"Average quarterly GDP level: ${avg_gdp:.0f}B over "
-            "the past year",
+            f"Average real GDP value over the past 4 quarters: "
+            f"${avg_gdp:,.0f}B (this is a level, not a change)",
             "GDPC1", avg_gdp, "value", "average",
             yr_ago, latest,
         ),
@@ -861,7 +1018,7 @@ def _claims_recession_risk(
         "ORDER BY date DESC LIMIT 1"
     ).fetchone()
     latest_date: str = latest_row[0][:7]
-    latest_prob: float = round(latest_row[0] and latest_row[1], 4)
+    latest_prob: float = round(latest_row[1], 4)
 
     yr_ago_date: str = _month_offset(latest_date, -12)
     yr_ago_row = conn.execute(
@@ -928,24 +1085,13 @@ def _claims_feature_snapshot(
     ).fetchone()
     features: dict[str, float] = json.loads(latest_row[0])
 
-    # Signal rules for recession heuristics
-    signal_rules: list[dict[str, Any]] = [
-        {"feature": "yield_spread", "condition": "lt", "threshold": 0},
-        {"feature": "yield_inverted_months", "condition": "gt",
-         "threshold": 0},
-        {"feature": "unrate_12m_change", "condition": "gt", "threshold": 0},
-        {"feature": "gdp_growth_annualized", "condition": "lt",
-         "threshold": 0},
-        {"feature": "info_employment_yoy", "condition": "lt", "threshold": 0},
-    ]
-
     red_count: int = 0
     strongest_red: str = ""
     strongest_red_val: float = 0.0
     strongest_green: str = ""
     strongest_green_val: float = 0.0
 
-    for rule in signal_rules:
+    for rule in SIGNAL_RULES:
         feat: str = rule["feature"]
         val: float = features.get(feat, 0.0)
         is_red: bool = (
@@ -1296,12 +1442,15 @@ def _context_yield_curve_unemployment(
 
     context_text: str = (
         f"Yield Curve (T10Y2Y) and Unemployment (UNRATE) data:\n"
-        f"- Current monthly avg yield spread: {current_spread:.2f}%\n"
+        f"- Current monthly avg yield spread: {current_spread:.2f}% "
+        f"(rate-type; describe changes in pp)\n"
         f"- Total months with inverted curve (spread < 0): {total_inv}\n"
         f"- Longest consecutive inversion: {longest_inv} months\n"
-        f"- Current UNRATE: {current_unrate:.1f}%\n"
+        f"- Current UNRATE: {current_unrate:.1f}% (rate-type; describe "
+        f"changes in pp)\n"
         f"- UNRATE 12 months ago: {unrate_12m_ago:.1f}%\n"
-        f"- 12-month UNRATE change: {unrate_change:+.1f} pp\n"
+        f"- 12-month UNRATE change: "
+        f"{_fmt_change('UNRATE', unrate_12m_ago, current_unrate)}\n"
         f"- Recent spreads (last 6 months): "
         f"{_fmt_series(spread_df['spread'], 2)}\n"
         f"- Recent UNRATE (last 6 months): "
@@ -1396,8 +1545,10 @@ def _context_cpi_trend(conn: sqlite3.Connection) -> dict[str, Any]:
 
     context_text: str = (
         f"CPI Inflation (CPIAUCSL) data:\n"
-        f"- Latest month-over-month change: {latest_mom:.2f}%\n"
-        f"- Latest year-over-year rate: {latest_yoy:.1f}%\n"
+        f"- Latest month-over-month change on the CPI level: "
+        f"{latest_mom:.2f}% (level-type; already a percent change)\n"
+        f"- Latest year-over-year rate: {latest_yoy:.1f}% (rate-type; "
+        f"describe changes to this rate in percentage points)\n"
         f"- Peak YoY inflation in dataset: {peak_yoy:.1f}%\n"
         f"- Average YoY rate (last 24 months): {avg_yoy_2y:.1f}%\n"
         f"- Recent MoM (last 6): {_fmt_series(cpi_df['mom'], 2)}\n"
@@ -1632,7 +1783,8 @@ def _context_u6_u3_gap(conn: sqlite3.Connection) -> dict[str, Any]:
     total_recent: int = len(recent)
 
     context_text: str = (
-        f"U6 vs U3 Unemployment Gap:\n"
+        f"U6 vs U3 Unemployment Gap (both are rate-type series; describe "
+        f"changes in percentage points, not relative percent):\n"
         f"- Current U3 (UNRATE): {current_u3:.1f}%\n"
         f"- Current U6 (U6RATE): {current_u6:.1f}%\n"
         f"- Current gap (U6 - U3): {current_gap:.1f} pp\n"
@@ -1760,11 +1912,15 @@ def _context_dashboard_intro(conn: sqlite3.Connection) -> dict[str, Any]:
 
     context_text: str = (
         f"Dashboard Macro Landscape Summary:\n"
-        f"- Latest UNRATE: {unrate_val:.1f}% ({latest_unrate})\n"
-        f"- GDP YoY change: {gdp_chg:+.2f}% ({gdp_latest})\n"
+        f"- Latest UNRATE: {unrate_val:.1f}% ({latest_unrate}) "
+        f"[rate-type series; describe changes in percentage points]\n"
+        f"- GDP YoY change: {gdp_chg:+.2f}% ({gdp_latest}) "
+        f"[already a percent change]\n"
         f"- Yield spread (T10Y2Y): {t10y2y_val:.2f}% "
-        f"({'inverted' if t10y2y_val < 0 else 'normal'})\n"
-        f"- CPI YoY inflation: {cpi_yoy:.2f}%\n"
+        f"({'inverted' if t10y2y_val < 0 else 'normal'}) "
+        f"[rate-type series; describe changes in percentage points]\n"
+        f"- CPI YoY inflation: {cpi_yoy:.2f}% "
+        f"[rate-type series; describe changes in percentage points]\n"
         f"- Dataset spans {total_months} months of observations"
     )
 
@@ -1803,6 +1959,14 @@ def _context_overview(conn: sqlite3.Connection) -> dict[str, Any]:
         _boundary_value(conn, "U6RATE", latest_unrate, latest_unrate, "end")
         or 0
     )
+    prev_unrate_val: float = float(
+        _boundary_value(conn, "UNRATE", prev_unrate, prev_unrate, "end")
+        or 0
+    )
+    prev_u6_val: float = float(
+        _boundary_value(conn, "U6RATE", prev_unrate, prev_unrate, "end")
+        or 0
+    )
     unrate_chg: float = _compute_change(
         conn, "UNRATE", prev_unrate, latest_unrate
     )
@@ -1824,12 +1988,16 @@ def _context_overview(conn: sqlite3.Connection) -> dict[str, Any]:
 
     context_text: str = (
         f"Overview KPI Synthesis:\n"
-        f"- UNRATE: {unrate_val:.1f}%, MoM change {unrate_chg:+.2f}%\n"
-        f"- U6RATE: {u6_val:.1f}%, MoM change {u6_chg:+.2f}%\n"
-        f"- GDP YoY growth: {gdp_chg:+.2f}%\n"
+        f"- UNRATE: {unrate_val:.1f}%, MoM change "
+        f"{_fmt_change('UNRATE', prev_unrate_val, unrate_val)}\n"
+        f"- U6RATE: {u6_val:.1f}%, MoM change "
+        f"{_fmt_change('U6RATE', prev_u6_val, u6_val)}\n"
+        f"- GDP YoY growth: {gdp_chg:+.2f}% (already a percent change)\n"
         f"- CPI YoY: {cpi_yoy:.2f}% "
-        f"({'above' if cpi_yoy > 3 else 'at or below'} 3%)\n"
-        f"- Yield spread: {t10y2y_val:.2f}%"
+        f"({'above' if cpi_yoy > 3 else 'at or below'} 3%; this is a rate, "
+        f"describe its own changes in pp)\n"
+        f"- Yield spread (T10Y2Y): {t10y2y_val:.2f}% "
+        f"({'inverted' if t10y2y_val < 0 else 'normal'})"
     )
 
     return {
@@ -1839,6 +2007,8 @@ def _context_overview(conn: sqlite3.Connection) -> dict[str, Any]:
             "u6": round(u6_val, 1),
             "unrate_mom": round(unrate_chg, 2),
             "u6_mom": round(u6_chg, 2),
+            "unrate_mom_pp": round(unrate_val - prev_unrate_val, 2),
+            "u6_mom_pp": round(u6_val - prev_u6_val, 2),
             "gdp_yoy": round(gdp_chg, 2),
             "cpi_yoy": round(cpi_yoy, 2),
             "t10y2y": round(t10y2y_val, 2),
@@ -1924,13 +2094,38 @@ def _context_feature_snapshot(conn: sqlite3.Connection) -> dict[str, Any]:
     prob: float = latest_row[1]
     features: dict[str, float] = json.loads(latest_row[2])
 
-    feature_lines: list[str] = [
-        f"  {k}: {v:.4f}" for k, v in sorted(features.items())
-    ]
+    # Label each feature tracked by SIGNAL_RULES with an explicit status so
+    # the LLM cannot invent warning signs from feature names alone.
+    labeled_features: set[str] = set()
+    feature_lines: list[str] = []
+    red_count: int = 0
+    for rule in SIGNAL_RULES:
+        feat: str = rule["feature"]
+        val: float = features.get(feat, 0.0)
+        is_red: bool = (
+            (rule["condition"] == "lt" and val < rule["threshold"])
+            or (rule["condition"] == "gt" and val > rule["threshold"])
+        )
+        if is_red:
+            label: str = "RED (warning)"
+            red_count += 1
+        elif val == 0:
+            label = "NEUTRAL"
+        else:
+            label = "GREEN (reassuring)"
+        feature_lines.append(f"  {feat}: {val:.4f}  [{label}]")
+        labeled_features.add(feat)
+    # Any additional features not in SIGNAL_RULES are shown without a label.
+    for feat, val in sorted(features.items()):
+        if feat not in labeled_features:
+            feature_lines.append(f"  {feat}: {val:.4f}  [untracked]")
 
     context_text: str = (
-        f"Feature Snapshot ({date}, risk={prob:.4f}):\n"
+        f"Feature Snapshot ({date}, risk score={prob:.4f}, "
+        f"red features={red_count}):\n"
         + "\n".join(feature_lines)
+        + "\n(The 'risk score' is a 0-1 reading, NOT a probability. "
+        "Treat only features marked RED as warning signs.)"
     )
 
     return {
@@ -1939,6 +2134,7 @@ def _context_feature_snapshot(conn: sqlite3.Connection) -> dict[str, Any]:
             "date": date,
             "probability": round(prob, 4),
             "features": features,
+            "red_count": red_count,
         },
     }
 
@@ -1985,11 +2181,14 @@ def _context_scenario_explorer(conn: sqlite3.Connection) -> dict[str, Any]:
 
     context_text: str = (
         f"Scenario Explorer:\n"
-        f"- Baseline risk (current features): {baseline:.4f}\n"
+        f"- Baseline risk score (current features, this IS the "
+        f"baseline): {baseline:.4f}\n"
         f"- Grid range: {grid_min:.6f} to {grid_max:.6f}\n"
         f"- Grid size: {grid_count} scenarios\n"
         f"- Most sensitive input: {most_sensitive}\n"
-        f"- Sensitivity by slider: "
+        f"- Sensitivity RANGE per slider (max probability minus min "
+        f"probability when varying that slider, NOT a baseline or a "
+        f"probability): "
         + ", ".join(f"{k}={v:.4f}" for k, v in sensitivity.items())
     )
 
@@ -2229,7 +2428,9 @@ INSIGHT_SLICES: list[dict[str, Any]] = [
             "in the data, explain what would change your outlook (e.g., "
             "if the yield curve inverts, if unemployment crosses a "
             "threshold), and give a forward-looking read. This paragraph "
-            "should feel like actionable intelligence, not a summary."
+            "should feel like actionable intelligence, not a summary.\n\n"
+            "Follow all system-prompt RULES — no causal verbs, no "
+            "probability language, no invented numbers."
         ),
     },
     {
@@ -2240,7 +2441,9 @@ INSIGHT_SLICES: list[dict[str, Any]] = [
         "analysis_prompt": (
             "Synthesize the 5 headline indicators into a cohesive "
             "2-sentence snapshot. Are they pointing in the same "
-            "direction or diverging?"
+            "direction or diverging? UNRATE and U6RATE are rates; "
+            "describe their MoM changes in percentage points, not "
+            "relative percent."
         ),
     },
     {
@@ -2249,9 +2452,11 @@ INSIGHT_SLICES: list[dict[str, Any]] = [
         "context_fn": _context_recession_risk,
         "claims_fn": _claims_recession_risk,
         "analysis_prompt": (
-            "Interpret the recession risk timeline. Is risk rising, "
-            "falling, or stable? How does the current level compare "
-            "to a year ago?"
+            "Interpret the recession risk timeline. Is the risk score "
+            "rising, falling, or stable? How does the current reading "
+            "compare to a year ago? The risk score is a 0-1 reading, "
+            "NOT a probability. Never say 'likelihood,' 'chance,' or "
+            "'probability.'"
         ),
     },
     {
@@ -2261,8 +2466,17 @@ INSIGHT_SLICES: list[dict[str, Any]] = [
         "claims_fn": _claims_feature_snapshot,
         "analysis_prompt": (
             "Explain what the feature snapshot says about current "
-            "recession risk. Which signals are most concerning and "
-            "which are reassuring?"
+            "recession risk. Only describe features labeled RED as "
+            "warning signs. Do not flag NEUTRAL or GREEN features as "
+            "concerning. Mention GREEN features as reassuring. Note "
+            "that several features (unrate_12m_change, "
+            "info_employment_yoy, gdp_growth_annualized) ARE ALREADY "
+            "deltas — describe their values as readings or levels "
+            "(e.g. 'reading +0.4pp', 'at -3.0%'), not as 'increased "
+            "by' or 'declined by' their own values. For yield_spread, "
+            "call a positive value 'positive' (not 'low'); 'low' "
+            "implies inversion risk and is reserved for values near "
+            "or below zero."
         ),
     },
     {
@@ -2273,7 +2487,14 @@ INSIGHT_SLICES: list[dict[str, Any]] = [
         "analysis_prompt": (
             "Describe what the scenario explorer reveals about "
             "recession sensitivity. Which input has the strongest "
-            "effect on risk?"
+            "effect on risk? Risk scores are on a 0-1 scale and are "
+            "NOT probabilities. Describe the baseline as a 'score of "
+            "X' not 'X% likelihood.' The baseline risk score is the "
+            "value labeled 'Baseline risk score' in the context. The "
+            "sensitivity RANGE values are NOT baselines and NOT "
+            "slider settings — they are the swing in risk score when "
+            "that slider is varied across the grid. Do not describe "
+            "a sensitivity value as a baseline or a slider setting."
         ),
     },
     {
@@ -2285,7 +2506,9 @@ INSIGHT_SLICES: list[dict[str, Any]] = [
             "Narrate the employment divergence between info and "
             "trades sectors. Focus on the post-ChatGPT period. "
             "Do not repeat the full-range trend. What changed "
-            "after Nov 2022?"
+            "after Nov 2022? The series are per-capita EMPLOYMENT "
+            "indexes, not productivity or output. Use 'employment' "
+            "explicitly."
         ),
     },
     {
@@ -2296,7 +2519,10 @@ INSIGHT_SLICES: list[dict[str, Any]] = [
         "analysis_prompt": (
             "Explain the energy paradox: power demand rising while "
             "info employment falls. Focus on the post-ChatGPT "
-            "period. What does this suggest about AI infrastructure?"
+            "period. What does this suggest about AI infrastructure? "
+            "Describe the relationship as 'coincides with' or "
+            "'tracks alongside'; the data does not prove that AI "
+            "causes energy demand."
         ),
     },
     {
@@ -2307,7 +2533,9 @@ INSIGHT_SLICES: list[dict[str, Any]] = [
         "analysis_prompt": (
             "Connect the employment divergence and energy paradox "
             "into a single narrative about AI's structural impact "
-            "on work."
+            "on work. Do not subtract the per-capita employment "
+            "index from the power output index — they are on "
+            "different scales. Reference each series on its own."
         ),
     },
     {
@@ -2317,7 +2545,9 @@ INSIGHT_SLICES: list[dict[str, Any]] = [
         "claims_fn": _claims_yield_curve_unemployment,
         "analysis_prompt": (
             "Analyze the correlation between yield curve inversions "
-            "and unemployment rate changes."
+            "and unemployment rate changes. Report unemployment "
+            "changes in percentage points. The yield spread average "
+            "is itself a rate value, report its level in percent."
         ),
     },
     {
@@ -2326,7 +2556,13 @@ INSIGHT_SLICES: list[dict[str, Any]] = [
         "context_fn": _context_gdp_trend,
         "claims_fn": _claims_gdp_trend,
         "analysis_prompt": (
-            "Analyze GDP growth trends and recession risk."
+            "Analyze GDP growth trends. The 'average quarterly GDP "
+            "level' is a dollar LEVEL, not a change. Do not describe "
+            "it as expansion or growth. Do not reference any "
+            "recession risk score, probability, or classifier "
+            "output — this slice is GDP-only. Every number in your "
+            "narrative must come from the KEY FINDINGS or DATA "
+            "CONTEXT for GDP."
         ),
     },
     {
@@ -2336,7 +2572,9 @@ INSIGHT_SLICES: list[dict[str, Any]] = [
         "claims_fn": _claims_cpi_trend,
         "analysis_prompt": (
             "Analyze CPI inflation trends. Is inflation cooling, "
-            "accelerating, or stabilizing?"
+            "accelerating, or stabilizing? CPI level changes are "
+            "percent changes; CPI YoY is a rate, describe its own "
+            "changes in percentage points."
         ),
     },
     {
@@ -2347,7 +2585,10 @@ INSIGHT_SLICES: list[dict[str, Any]] = [
         "analysis_prompt": (
             "Compare info sector vs specialty trades employment "
             "per capita. What does the divergence reveal about "
-            "AI's impact on the labor market?"
+            "AI's impact on the labor market? These are per-capita "
+            "EMPLOYMENT indexes. Do not call them productivity, "
+            "output, or activity. Describe the relationship with "
+            "'coincides with.'"
         ),
     },
     {
@@ -2357,7 +2598,9 @@ INSIGHT_SLICES: list[dict[str, Any]] = [
         "claims_fn": _claims_employment_growth,
         "analysis_prompt": (
             "Analyze rolling per-capita employment growth for both "
-            "sectors. Which shows stronger momentum?"
+            "sectors. Which shows stronger momentum? YoY growth is "
+            "already a percent change; do not add a 'pp' suffix. "
+            "Describe direction without asserting causation."
         ),
     },
     {
@@ -2367,7 +2610,9 @@ INSIGHT_SLICES: list[dict[str, Any]] = [
         "claims_fn": _claims_covid_recovery,
         "analysis_prompt": (
             "Compare COVID recovery trajectories between info and "
-            "trades sectors."
+            "trades sectors. These are recovery ratios (percent of "
+            "pre-COVID peak). Describe as percent recovery, not "
+            "productivity."
         ),
     },
     {
@@ -2377,7 +2622,8 @@ INSIGHT_SLICES: list[dict[str, Any]] = [
         "claims_fn": _claims_u6_u3_gap,
         "analysis_prompt": (
             "Analyze the U6 vs U3 gap and what it reveals about "
-            "hidden labor market slack."
+            "hidden labor market slack. Both rates are percentages. "
+            "Describe the gap and its changes in percentage points."
         ),
     },
     {
@@ -2387,8 +2633,9 @@ INSIGHT_SLICES: list[dict[str, Any]] = [
         "claims_fn": _claims_power_vs_info,
         "analysis_prompt": (
             "Analyze electric power output vs info employment. "
-            "Power rising while info falls could signal AI's energy "
-            "footprint displacing workers."
+            "Use 'coincides with' or 'tracks alongside' — the data "
+            "does not prove AI causes the divergence. Do not say "
+            "'displaces' or 'drives.'"
         ),
     },
     {
@@ -2399,7 +2646,10 @@ INSIGHT_SLICES: list[dict[str, Any]] = [
         "analysis_prompt": (
             "Synthesize all macro indicators into a cohesive "
             "narrative about recession risk and AI's labor market "
-            "impact."
+            "impact. Describe any recession risk score as a 0-1 "
+            "reading. Use correlation language ('coincides with,' "
+            "'tracks alongside') for multi-series relationships. No "
+            "causal verbs."
         ),
     },
 ]
@@ -2483,6 +2733,34 @@ def _parse_narrative(raw_text: str) -> str:
     return text
 
 
+def _validate_narrative(
+    narrative: str,
+    metric_key: str,
+) -> list[str]:
+    """Scan a narrative for known anti-patterns and emit warnings.
+
+    Runs after _parse_narrative(). Each regex in NARRATIVE_PATTERNS that
+    matches produces a warning string. Warnings are logged and returned for
+    optional re-generation. Storage is NOT blocked — operators decide
+    whether to rerun.
+
+    Args:
+        narrative: Cleaned narrative text.
+        metric_key: The slice's metric_key, for log context.
+
+    Returns:
+        List of warning strings. Empty list means the narrative is clean.
+    """
+    warnings: list[str] = []
+    for pattern, message in NARRATIVE_PATTERNS:
+        if re.search(pattern, narrative):
+            warnings.append(f"[{metric_key}] {message}")
+            logger.warning(
+                "Narrative validator flagged %s: %s", metric_key, message
+            )
+    return warnings
+
+
 def _store_insight(
     conn: sqlite3.Connection,
     metric_key: str,
@@ -2563,10 +2841,19 @@ def generate_insight(
     try:
         raw_response: str = _call_llm(model, user_prompt)
         narrative: str = _parse_narrative(raw_response)
+        warnings: list[str] = _validate_narrative(narrative, metric_key)
         _store_insight(
             conn, metric_key, slice_key, insight_type,
             narrative, claims, model,
         )
+        if warnings:
+            logger.warning(
+                "Stored %s/%s with %d validator warning(s) — "
+                "review narrative",
+                metric_key,
+                insight_type,
+                len(warnings),
+            )
         logger.info(
             "Stored insight: %s / %s (%d claims)",
             metric_key,

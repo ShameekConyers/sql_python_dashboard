@@ -552,3 +552,96 @@ class TestFmtSeries:
         result: str = ai_insights._fmt_series(s, 1)
         assert "1.0" in result
         assert "3.0" in result
+
+
+# ---------------------------------------------------------------------------
+# Phase 10: narrative validator and unit-aware formatter tests
+# ---------------------------------------------------------------------------
+
+
+class TestValidateNarrative:
+    """Tests for the post-generation narrative anti-pattern validator."""
+
+    def test_catches_probability_language(self) -> None:
+        """Flags '67% likelihood of a recession' as probability language."""
+        warnings: list[str] = ai_insights._validate_narrative(
+            "The Scenario Explorer reveals a roughly 67% likelihood of a "
+            "recession occurring within the next year.",
+            "scenario_explorer",
+        )
+        assert warnings
+        assert any("probability" in w.lower() for w in warnings)
+
+    def test_catches_productivity_terminology(self) -> None:
+        """Flags 'decline in productivity' as wrong-terminology usage."""
+        warnings: list[str] = ai_insights._validate_narrative(
+            "The information sector has experienced a significant decline "
+            "in productivity over the past year.",
+            "deep_divergence",
+        )
+        assert warnings
+        assert any("employment" in w.lower() for w in warnings)
+
+    def test_catches_causal_verbs(self) -> None:
+        """Flags 'AI is displacing workers' as a causal assertion."""
+        warnings: list[str] = ai_insights._validate_narrative(
+            "AI is displacing workers in the information sector.",
+            "IPG2211S_USINFO",
+        )
+        assert warnings
+        assert any(
+            "coincides" in w.lower() or "causation" in w.lower()
+            for w in warnings
+        )
+
+    def test_catches_quarterly_expansion_dollars(self) -> None:
+        """Flags dollar-billion 'quarterly expansion' phrasing."""
+        warnings: list[str] = ai_insights._validate_narrative(
+            "Notably lower than the average quarterly expansion of "
+            "$23800B over the past year.",
+            "GDPC1",
+        )
+        assert warnings
+        assert any(
+            "level" in w.lower() or "expansion" in w.lower()
+            for w in warnings
+        )
+
+    def test_clean_narrative_returns_empty(self) -> None:
+        """A compliant narrative produces no warnings."""
+        warnings: list[str] = ai_insights._validate_narrative(
+            "Unemployment ticked up to 4.4%, a +0.1pp MoM move from 4.3%. "
+            "The risk score reads 0.67, consistent with a cooling labor "
+            "market that coincides with the rising yield spread.",
+            "overview",
+        )
+        assert warnings == []
+
+
+class TestFmtChange:
+    """Tests for the unit-aware change formatter."""
+
+    def test_rate_series_reports_pp(self) -> None:
+        """Rate-type series (UNRATE) reports percentage points first."""
+        result: str = ai_insights._fmt_change("UNRATE", 4.3, 4.4)
+        assert "+0.10pp" in result
+        assert "report in pp" in result
+
+    def test_level_series_reports_percent(self) -> None:
+        """Level-type series (GDPC1) reports relative percent change."""
+        result: str = ai_insights._fmt_change("GDPC1", 23000.0, 23500.0)
+        # (23500 - 23000) / 23000 = +2.17%
+        assert "+2.17%" in result
+        assert "report as percent change" in result
+
+
+class TestSeriesKind:
+    """Tests for the SERIES_KIND lookup coverage."""
+
+    def test_covers_all_known_series(self) -> None:
+        """Every FRED series in SERIES_META has an entry in SERIES_KIND."""
+        known_series: list[str] = [sid for sid, *_ in SERIES_META]
+        for series_id in known_series:
+            assert series_id in ai_insights.SERIES_KIND, (
+                f"{series_id} missing from SERIES_KIND"
+            )
