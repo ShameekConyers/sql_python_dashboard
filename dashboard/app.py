@@ -346,11 +346,6 @@ def render_ai_insight_block(metric_key: str, insight_type: str, full: bool = Fal
     except (json.JSONDecodeError, TypeError):
         citations = []
 
-    # Pull per-citation verification results (ref_exists, excerpt_matches)
-    citation_verifications: list[dict] = (
-        verification.get("citations", []) if isinstance(verification, dict) else []
-    )
-
     with st.expander("AI Insight", expanded=True):
         st.markdown(banner)
         st.markdown(insight["narrative"])
@@ -384,25 +379,12 @@ def render_ai_insight_block(metric_key: str, insight_type: str, full: bool = Fal
             if citations:
                 st.markdown("---")
                 st.markdown("**Reference Citations**")
-                # Build a lookup of verification results by ref_id so each
-                # cited source can show a ✓ or ⚠ icon derived from
-                # ref_exists && excerpt_matches.
-                verification_by_id: dict[int, dict] = {
-                    int(v.get("ref_id")): v
-                    for v in citation_verifications
-                    if v.get("ref_id") is not None
-                }
                 for cit in citations:
                     ref_id: int = int(cit.get("ref_id", 0))
-                    ver = verification_by_id.get(ref_id, {})
-                    ok: bool = bool(
-                        ver.get("ref_exists") and ver.get("excerpt_matches")
-                    )
-                    icon: str = "✓" if ok else "⚠"
                     title: str = cit.get("title", f"Reference {ref_id}")
                     excerpt: str = cit.get("excerpt", "")
                     source_url: str | None = cit.get("source_url")
-                    st.markdown(f"**{title}** {icon}")
+                    st.markdown(f"**{title}**")
                     if excerpt:
                         st.markdown(f"> {excerpt}")
                     if source_url:
