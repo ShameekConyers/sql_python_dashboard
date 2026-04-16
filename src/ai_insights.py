@@ -741,6 +741,434 @@ def _claims_power_vs_info(
     ]
 
 
+def _claims_dashboard_intro(
+    conn: sqlite3.Connection,
+) -> list[dict[str, Any]]:
+    """Build verifiable claims for the dashboard intro insight.
+
+    Args:
+        conn: SQLite database connection.
+
+    Returns:
+        List of structured claim dicts.
+    """
+    latest_unrate: str = _latest_month(conn, "UNRATE")
+    latest_gdp: str = _latest_month(conn, "GDPC1")
+    latest_t10y2y: str = _latest_month(conn, "T10Y2Y")
+    earliest: str = _earliest_month(conn, "UNRATE")
+
+    unrate_val: float | None = _boundary_value(
+        conn, "UNRATE", earliest, latest_unrate, "end",
+    )
+    t10y2y_val: float | None = _boundary_value(
+        conn, "T10Y2Y", earliest, latest_t10y2y, "end",
+    )
+    gdp_yr_ago: str = _month_offset(latest_gdp, -12)
+    gdp_chg: float = _compute_change(conn, "GDPC1", gdp_yr_ago, latest_gdp)
+
+    total_months: int = conn.execute(
+        "SELECT COUNT(DISTINCT SUBSTR(date, 1, 7)) FROM observations"
+    ).fetchone()[0]
+
+    claims: list[dict[str, Any]] = [
+        _make_claim(
+            f"Unemployment at {unrate_val:.1f}%",
+            "UNRATE", round(unrate_val or 0, 1), "value", "latest",
+            latest_unrate, latest_unrate,
+        ),
+        _make_claim(
+            f"GDP changed {gdp_chg:+.2f}% over the past year",
+            "GDPC1", gdp_chg, "value", "change_pct",
+            gdp_yr_ago, latest_gdp,
+        ),
+        _make_claim(
+            f"Yield spread at {t10y2y_val:.2f}%, "
+            f"{'inverted' if (t10y2y_val or 0) < 0 else 'normal'}",
+            "T10Y2Y", round(t10y2y_val or 0, 2), "value", "latest",
+            latest_t10y2y, latest_t10y2y,
+        ),
+    ]
+    return claims
+
+
+def _claims_overview(
+    conn: sqlite3.Connection,
+) -> list[dict[str, Any]]:
+    """Build verifiable claims for the overview KPI synthesis insight.
+
+    Args:
+        conn: SQLite database connection.
+
+    Returns:
+        List of structured claim dicts.
+    """
+    latest_unrate: str = _latest_month(conn, "UNRATE")
+    latest_gdp: str = _latest_month(conn, "GDPC1")
+    latest_cpi: str = _latest_month(conn, "CPIAUCSL")
+    yr_ago_unrate: str = _month_offset(latest_unrate, -1)
+    yr_ago_cpi: str = _month_offset(latest_cpi, -12)
+
+    unrate_chg: float = _compute_change(
+        conn, "UNRATE", yr_ago_unrate, latest_unrate,
+    )
+    u6_chg: float = _compute_change(
+        conn, "U6RATE", yr_ago_unrate, latest_unrate,
+    )
+    gdp_yr_ago: str = _month_offset(latest_gdp, -12)
+    gdp_chg: float = _compute_change(conn, "GDPC1", gdp_yr_ago, latest_gdp)
+    cpi_yoy: float = _compute_change(
+        conn, "CPIAUCSL", yr_ago_cpi, latest_cpi,
+    )
+
+    return [
+        _make_claim(
+            f"UNRATE MoM change: {unrate_chg:+.2f}%",
+            "UNRATE", unrate_chg, "value", "change_pct",
+            yr_ago_unrate, latest_unrate,
+        ),
+        _make_claim(
+            f"U6RATE MoM change: {u6_chg:+.2f}%",
+            "U6RATE", u6_chg, "value", "change_pct",
+            yr_ago_unrate, latest_unrate,
+        ),
+        _make_claim(
+            f"GDP growth {'positive' if gdp_chg > 0 else 'negative'} "
+            f"at {gdp_chg:+.2f}%",
+            "GDPC1", gdp_chg, "value", "change_pct",
+            gdp_yr_ago, latest_gdp,
+        ),
+        _make_claim(
+            f"CPI YoY at {cpi_yoy:.2f}%",
+            "CPIAUCSL", cpi_yoy, "value", "change_pct",
+            yr_ago_cpi, latest_cpi,
+        ),
+    ]
+
+
+def _claims_recession_risk(
+    conn: sqlite3.Connection,
+) -> list[dict[str, Any]]:
+    """Build verifiable claims for the recession risk timeline insight.
+
+    Args:
+        conn: SQLite database connection.
+
+    Returns:
+        List of structured claim dicts.
+    """
+    latest_row = conn.execute(
+        "SELECT date, probability FROM recession_predictions "
+        "ORDER BY date DESC LIMIT 1"
+    ).fetchone()
+    latest_date: str = latest_row[0][:7]
+    latest_prob: float = round(latest_row[0] and latest_row[1], 4)
+
+    yr_ago_date: str = _month_offset(latest_date, -12)
+    yr_ago_row = conn.execute(
+        "SELECT probability FROM recession_predictions "
+        "WHERE date <= ? ORDER BY date DESC LIMIT 1",
+        (f"{yr_ago_date}-31",),
+    ).fetchone()
+    yr_ago_prob: float = round(yr_ago_row[0], 4) if yr_ago_row else 0.0
+
+    above_count: int = conn.execute(
+        "SELECT COUNT(*) FROM recession_predictions WHERE probability > 0.5"
+    ).fetchone()[0]
+
+    # 6-month trend direction
+    six_ago: str = _month_offset(latest_date, -6)
+    six_row = conn.execute(
+        "SELECT probability FROM recession_predictions "
+        "WHERE date <= ? ORDER BY date DESC LIMIT 1",
+        (f"{six_ago}-31",),
+    ).fetchone()
+    six_prob: float = six_row[0] if six_row else latest_prob
+    trend_dir: float = 1.0 if latest_prob > six_prob else -1.0
+
+    return [
+        _make_claim(
+            f"Latest recession risk score: {latest_prob:.4f}",
+            "recession_risk", latest_prob, "value", "prediction_latest",
+            latest_date, latest_date,
+        ),
+        _make_claim(
+            f"Risk score 12 months ago: {yr_ago_prob:.4f}",
+            "recession_risk", yr_ago_prob, "value", "prediction_at_date",
+            yr_ago_date, yr_ago_date,
+        ),
+        _make_claim(
+            f"{above_count} months above 0.5 threshold",
+            "recession_risk", above_count, "count",
+            "prediction_count_above",
+            period_start="", period_end="",
+            threshold=0.5,
+        ),
+        _make_claim(
+            f"6-month trend: {'rising' if trend_dir > 0 else 'falling'}",
+            "recession_risk", trend_dir, "trend", "prediction_direction",
+            six_ago, latest_date,
+        ),
+    ]
+
+
+def _claims_feature_snapshot(
+    conn: sqlite3.Connection,
+) -> list[dict[str, Any]]:
+    """Build verifiable claims for the feature contribution snapshot insight.
+
+    Args:
+        conn: SQLite database connection.
+
+    Returns:
+        List of structured claim dicts.
+    """
+    latest_row = conn.execute(
+        "SELECT features_json FROM recession_predictions "
+        "ORDER BY date DESC LIMIT 1"
+    ).fetchone()
+    features: dict[str, float] = json.loads(latest_row[0])
+
+    # Signal rules for recession heuristics
+    signal_rules: list[dict[str, Any]] = [
+        {"feature": "yield_spread", "condition": "lt", "threshold": 0},
+        {"feature": "yield_inverted_months", "condition": "gt",
+         "threshold": 0},
+        {"feature": "unrate_12m_change", "condition": "gt", "threshold": 0},
+        {"feature": "gdp_growth_annualized", "condition": "lt",
+         "threshold": 0},
+        {"feature": "info_employment_yoy", "condition": "lt", "threshold": 0},
+    ]
+
+    red_count: int = 0
+    strongest_red: str = ""
+    strongest_red_val: float = 0.0
+    strongest_green: str = ""
+    strongest_green_val: float = 0.0
+
+    for rule in signal_rules:
+        feat: str = rule["feature"]
+        val: float = features.get(feat, 0.0)
+        is_red: bool = (
+            (rule["condition"] == "lt" and val < rule["threshold"])
+            or (rule["condition"] == "gt" and val > rule["threshold"])
+        )
+        if is_red:
+            red_count += 1
+            if abs(val) > abs(strongest_red_val):
+                strongest_red = feat
+                strongest_red_val = val
+        else:
+            if abs(val) > abs(strongest_green_val):
+                strongest_green = feat
+                strongest_green_val = val
+
+    return [
+        _make_claim(
+            f"{red_count} features flashing recession signals",
+            "feature_snapshot", red_count, "count",
+            "feature_red_count",
+        ),
+        _make_claim(
+            f"Strongest recession signal: {strongest_red}",
+            "feature_snapshot", strongest_red_val, "value",
+            "feature_value",
+        ),
+        _make_claim(
+            f"Strongest healthy signal: {strongest_green}",
+            "feature_snapshot", strongest_green_val, "value",
+            "feature_value",
+        ),
+    ]
+
+
+def _claims_scenario_explorer(
+    conn: sqlite3.Connection,
+) -> list[dict[str, Any]]:
+    """Build verifiable claims for the scenario explorer insight.
+
+    Args:
+        conn: SQLite database connection.
+
+    Returns:
+        List of structured claim dicts.
+    """
+    # Baseline: latest prediction probability
+    baseline_row = conn.execute(
+        "SELECT probability FROM recession_predictions "
+        "ORDER BY date DESC LIMIT 1"
+    ).fetchone()
+    baseline: float = round(baseline_row[0], 4)
+
+    extremes = conn.execute(
+        "SELECT MIN(probability), MAX(probability) FROM scenario_grid"
+    ).fetchone()
+    grid_min: float = round(extremes[0], 6)
+    grid_max: float = round(extremes[1], 6)
+
+    return [
+        _make_claim(
+            f"Baseline scenario risk score: {baseline:.4f}",
+            "scenario_explorer", baseline, "value", "prediction_latest",
+        ),
+        _make_claim(
+            f"Lowest risk in scenario grid: {grid_min:.6f}",
+            "scenario_explorer", grid_min, "value", "scenario_min",
+        ),
+        _make_claim(
+            f"Highest risk in scenario grid: {grid_max:.6f}",
+            "scenario_explorer", grid_max, "value", "scenario_max",
+        ),
+    ]
+
+
+def _claims_deep_divergence(
+    conn: sqlite3.Connection,
+) -> list[dict[str, Any]]:
+    """Build verifiable claims for the deep dive employment divergence.
+
+    Focuses on the post-ChatGPT window (Nov 2022 onward).
+
+    Args:
+        conn: SQLite database connection.
+
+    Returns:
+        List of structured claim dicts.
+    """
+    latest: str = _latest_month(conn, "USINFO")
+    chatgpt: str = CHATGPT_LAUNCH
+
+    info_pct: float = _compute_pct_of_start(
+        conn, "USINFO", chatgpt, latest, per_capita=True,
+    )
+    trades_pct: float = _compute_pct_of_start(
+        conn, "CES2023800001", chatgpt, latest, per_capita=True,
+    )
+    info_chg: float = _compute_change(
+        conn, "USINFO", chatgpt, latest, per_capita=True,
+    )
+    gap: float = round(trades_pct - info_pct, 2)
+
+    return [
+        _make_claim(
+            f"Info sector per-capita index at {info_pct}% of Nov 2022 level",
+            "USINFO", info_pct, "value", "pct_of_start",
+            chatgpt, latest, per_capita=True,
+        ),
+        _make_claim(
+            f"Trades per-capita index at {trades_pct}% of Nov 2022 level",
+            "CES2023800001", trades_pct, "value", "pct_of_start",
+            chatgpt, latest, per_capita=True,
+        ),
+        _make_claim(
+            f"Post-ChatGPT info sector per-capita change: {info_chg:+.2f}%",
+            "USINFO", info_chg, "value", "change_pct",
+            chatgpt, latest, per_capita=True,
+        ),
+    ]
+
+
+def _claims_deep_energy(
+    conn: sqlite3.Connection,
+) -> list[dict[str, Any]]:
+    """Build verifiable claims for the deep dive energy paradox.
+
+    Focuses on the post-ChatGPT window (Nov 2022 onward).
+
+    Args:
+        conn: SQLite database connection.
+
+    Returns:
+        List of structured claim dicts.
+    """
+    latest: str = _latest_month(conn, "IPG2211S")
+    chatgpt: str = CHATGPT_LAUNCH
+
+    power_pct: float = _compute_pct_of_start(
+        conn, "IPG2211S", chatgpt, latest,
+    )
+    info_pct: float = _compute_pct_of_start(
+        conn, "USINFO", chatgpt, latest,
+    )
+    power_chg: float = _compute_change(
+        conn, "IPG2211S", chatgpt, latest,
+    )
+    info_chg: float = _compute_change(
+        conn, "USINFO", chatgpt, latest,
+    )
+
+    return [
+        _make_claim(
+            f"Power output at {power_pct}% of Nov 2022 level",
+            "IPG2211S", power_pct, "value", "pct_of_start",
+            chatgpt, latest,
+        ),
+        _make_claim(
+            f"Info employment at {info_pct}% of Nov 2022 level",
+            "USINFO", info_pct, "value", "pct_of_start",
+            chatgpt, latest,
+        ),
+        _make_claim(
+            f"Power output changed {power_chg:+.2f}% post-ChatGPT",
+            "IPG2211S", power_chg, "value", "change_pct",
+            chatgpt, latest,
+        ),
+        _make_claim(
+            f"Info employment changed {info_chg:+.2f}% post-ChatGPT",
+            "USINFO", info_chg, "value", "change_pct",
+            chatgpt, latest,
+        ),
+    ]
+
+
+def _claims_deep_synthesis_charts(
+    conn: sqlite3.Connection,
+) -> list[dict[str, Any]]:
+    """Build verifiable claims for the deep dive synthesis insight.
+
+    Connects employment divergence and energy paradox narratives.
+
+    Args:
+        conn: SQLite database connection.
+
+    Returns:
+        List of structured claim dicts.
+    """
+    latest: str = _latest_month(conn, "USINFO")
+    chatgpt: str = CHATGPT_LAUNCH
+
+    info_pct: float = _compute_pct_of_start(
+        conn, "USINFO", chatgpt, latest, per_capita=True,
+    )
+    trades_pct: float = _compute_pct_of_start(
+        conn, "CES2023800001", chatgpt, latest, per_capita=True,
+    )
+    divergence_gap: float = round(trades_pct - info_pct, 2)
+
+    power_pct: float = _compute_pct_of_start(
+        conn, "IPG2211S", chatgpt, latest,
+    )
+    power_info_gap: float = round(power_pct - info_pct, 2)
+
+    return [
+        _make_claim(
+            f"Trades-info per-capita divergence: {divergence_gap:+.2f}pp "
+            "since ChatGPT",
+            "CES2023800001", trades_pct, "value", "pct_of_start",
+            chatgpt, latest, per_capita=True,
+        ),
+        _make_claim(
+            f"Power-info gap: {power_info_gap:+.2f}pp post-ChatGPT",
+            "IPG2211S", power_pct, "value", "pct_of_start",
+            chatgpt, latest,
+        ),
+        _make_claim(
+            f"Info sector per-capita at {info_pct}% of Nov 2022",
+            "USINFO", info_pct, "value", "pct_of_start",
+            chatgpt, latest, per_capita=True,
+        ),
+    ]
+
+
 def _claims_synthesis(
     conn: sqlite3.Connection,
 ) -> list[dict[str, Any]]:
@@ -1297,6 +1725,437 @@ def _context_power_vs_info(conn: sqlite3.Connection) -> dict[str, Any]:
     }
 
 
+def _context_dashboard_intro(conn: sqlite3.Connection) -> dict[str, Any]:
+    """Build data context for the dashboard intro macro landscape summary.
+
+    Args:
+        conn: SQLite database connection.
+
+    Returns:
+        Dict with 'context_text' and 'data_points'.
+    """
+    latest_unrate: str = _latest_month(conn, "UNRATE")
+    unrate_val: float = float(
+        _boundary_value(conn, "UNRATE", latest_unrate, latest_unrate, "end")
+        or 0
+    )
+    gdp_latest: str = _latest_month(conn, "GDPC1")
+    gdp_yr_ago: str = _month_offset(gdp_latest, -12)
+    gdp_chg: float = _compute_change(conn, "GDPC1", gdp_yr_ago, gdp_latest)
+
+    t10y2y_latest: str = _latest_month(conn, "T10Y2Y")
+    t10y2y_val: float = float(
+        _boundary_value(conn, "T10Y2Y", t10y2y_latest, t10y2y_latest, "end")
+        or 0
+    )
+    cpi_latest: str = _latest_month(conn, "CPIAUCSL")
+    cpi_yr_ago: str = _month_offset(cpi_latest, -12)
+    cpi_yoy: float = _compute_change(
+        conn, "CPIAUCSL", cpi_yr_ago, cpi_latest
+    )
+
+    total_months: int = conn.execute(
+        "SELECT COUNT(DISTINCT SUBSTR(date, 1, 7)) FROM observations"
+    ).fetchone()[0]
+
+    context_text: str = (
+        f"Dashboard Macro Landscape Summary:\n"
+        f"- Latest UNRATE: {unrate_val:.1f}% ({latest_unrate})\n"
+        f"- GDP YoY change: {gdp_chg:+.2f}% ({gdp_latest})\n"
+        f"- Yield spread (T10Y2Y): {t10y2y_val:.2f}% "
+        f"({'inverted' if t10y2y_val < 0 else 'normal'})\n"
+        f"- CPI YoY inflation: {cpi_yoy:.2f}%\n"
+        f"- Dataset spans {total_months} months of observations"
+    )
+
+    return {
+        "context_text": context_text,
+        "data_points": {
+            "unrate": round(unrate_val, 1),
+            "gdp_change": round(gdp_chg, 2),
+            "t10y2y": round(t10y2y_val, 2),
+            "cpi_yoy": round(cpi_yoy, 2),
+            "total_months": total_months,
+        },
+    }
+
+
+def _context_overview(conn: sqlite3.Connection) -> dict[str, Any]:
+    """Build data context for the overview KPI synthesis insight.
+
+    Args:
+        conn: SQLite database connection.
+
+    Returns:
+        Dict with 'context_text' and 'data_points'.
+    """
+    latest_unrate: str = _latest_month(conn, "UNRATE")
+    prev_unrate: str = _month_offset(latest_unrate, -1)
+    latest_gdp: str = _latest_month(conn, "GDPC1")
+    latest_cpi: str = _latest_month(conn, "CPIAUCSL")
+    cpi_yr_ago: str = _month_offset(latest_cpi, -12)
+
+    unrate_val: float = float(
+        _boundary_value(conn, "UNRATE", latest_unrate, latest_unrate, "end")
+        or 0
+    )
+    u6_val: float = float(
+        _boundary_value(conn, "U6RATE", latest_unrate, latest_unrate, "end")
+        or 0
+    )
+    unrate_chg: float = _compute_change(
+        conn, "UNRATE", prev_unrate, latest_unrate
+    )
+    u6_chg: float = _compute_change(
+        conn, "U6RATE", prev_unrate, latest_unrate
+    )
+    gdp_yr_ago: str = _month_offset(latest_gdp, -12)
+    gdp_chg: float = _compute_change(conn, "GDPC1", gdp_yr_ago, latest_gdp)
+    cpi_yoy: float = _compute_change(
+        conn, "CPIAUCSL", cpi_yr_ago, latest_cpi
+    )
+    t10y2y_val: float = float(
+        _boundary_value(
+            conn, "T10Y2Y",
+            _latest_month(conn, "T10Y2Y"),
+            _latest_month(conn, "T10Y2Y"), "end",
+        ) or 0
+    )
+
+    context_text: str = (
+        f"Overview KPI Synthesis:\n"
+        f"- UNRATE: {unrate_val:.1f}%, MoM change {unrate_chg:+.2f}%\n"
+        f"- U6RATE: {u6_val:.1f}%, MoM change {u6_chg:+.2f}%\n"
+        f"- GDP YoY growth: {gdp_chg:+.2f}%\n"
+        f"- CPI YoY: {cpi_yoy:.2f}% "
+        f"({'above' if cpi_yoy > 3 else 'at or below'} 3%)\n"
+        f"- Yield spread: {t10y2y_val:.2f}%"
+    )
+
+    return {
+        "context_text": context_text,
+        "data_points": {
+            "unrate": round(unrate_val, 1),
+            "u6": round(u6_val, 1),
+            "unrate_mom": round(unrate_chg, 2),
+            "u6_mom": round(u6_chg, 2),
+            "gdp_yoy": round(gdp_chg, 2),
+            "cpi_yoy": round(cpi_yoy, 2),
+            "t10y2y": round(t10y2y_val, 2),
+        },
+    }
+
+
+def _context_recession_risk(conn: sqlite3.Connection) -> dict[str, Any]:
+    """Build data context for the recession risk timeline insight.
+
+    Args:
+        conn: SQLite database connection.
+
+    Returns:
+        Dict with 'context_text' and 'data_points'.
+    """
+    latest_row = conn.execute(
+        "SELECT date, probability FROM recession_predictions "
+        "ORDER BY date DESC LIMIT 1"
+    ).fetchone()
+    latest_date: str = latest_row[0][:7]
+    latest_prob: float = latest_row[1]
+
+    yr_ago_date: str = _month_offset(latest_date, -12)
+    yr_ago_row = conn.execute(
+        "SELECT probability FROM recession_predictions "
+        "WHERE date <= ? ORDER BY date DESC LIMIT 1",
+        (f"{yr_ago_date}-31",),
+    ).fetchone()
+    yr_ago_prob: float = yr_ago_row[0] if yr_ago_row else 0.0
+
+    above_count: int = conn.execute(
+        "SELECT COUNT(*) FROM recession_predictions WHERE probability > 0.5"
+    ).fetchone()[0]
+    total_count: int = conn.execute(
+        "SELECT COUNT(*) FROM recession_predictions"
+    ).fetchone()[0]
+
+    six_ago: str = _month_offset(latest_date, -6)
+    six_row = conn.execute(
+        "SELECT probability FROM recession_predictions "
+        "WHERE date <= ? ORDER BY date DESC LIMIT 1",
+        (f"{six_ago}-31",),
+    ).fetchone()
+    six_prob: float = six_row[0] if six_row else latest_prob
+
+    context_text: str = (
+        f"Recession Risk Timeline:\n"
+        f"- Latest risk score: {latest_prob:.4f} ({latest_date})\n"
+        f"- Score 12 months ago: {yr_ago_prob:.4f}\n"
+        f"- Change: {latest_prob - yr_ago_prob:+.4f}\n"
+        f"- Months above 0.5: {above_count}/{total_count}\n"
+        f"- 6-month trend: {latest_prob:.4f} vs {six_prob:.4f} "
+        f"({'rising' if latest_prob > six_prob else 'falling'})"
+    )
+
+    return {
+        "context_text": context_text,
+        "data_points": {
+            "latest_prob": round(latest_prob, 4),
+            "yr_ago_prob": round(yr_ago_prob, 4),
+            "above_threshold": above_count,
+            "total_predictions": total_count,
+            "six_month_ago_prob": round(six_prob, 4),
+        },
+    }
+
+
+def _context_feature_snapshot(conn: sqlite3.Connection) -> dict[str, Any]:
+    """Build data context for the feature contribution snapshot insight.
+
+    Args:
+        conn: SQLite database connection.
+
+    Returns:
+        Dict with 'context_text' and 'data_points'.
+    """
+    latest_row = conn.execute(
+        "SELECT date, probability, features_json FROM recession_predictions "
+        "ORDER BY date DESC LIMIT 1"
+    ).fetchone()
+    date: str = latest_row[0][:7]
+    prob: float = latest_row[1]
+    features: dict[str, float] = json.loads(latest_row[2])
+
+    feature_lines: list[str] = [
+        f"  {k}: {v:.4f}" for k, v in sorted(features.items())
+    ]
+
+    context_text: str = (
+        f"Feature Snapshot ({date}, risk={prob:.4f}):\n"
+        + "\n".join(feature_lines)
+    )
+
+    return {
+        "context_text": context_text,
+        "data_points": {
+            "date": date,
+            "probability": round(prob, 4),
+            "features": features,
+        },
+    }
+
+
+def _context_scenario_explorer(conn: sqlite3.Connection) -> dict[str, Any]:
+    """Build data context for the scenario explorer insight.
+
+    Args:
+        conn: SQLite database connection.
+
+    Returns:
+        Dict with 'context_text' and 'data_points'.
+    """
+    baseline_row = conn.execute(
+        "SELECT probability FROM recession_predictions "
+        "ORDER BY date DESC LIMIT 1"
+    ).fetchone()
+    baseline: float = baseline_row[0]
+
+    extremes = conn.execute(
+        "SELECT MIN(probability), MAX(probability) FROM scenario_grid"
+    ).fetchone()
+    grid_min: float = extremes[0]
+    grid_max: float = extremes[1]
+    grid_count: int = conn.execute(
+        "SELECT COUNT(*) FROM scenario_grid"
+    ).fetchone()[0]
+
+    # Which slider has biggest range of effect?
+    slider_cols = [
+        "yield_spread", "unrate", "gdp_growth_annualized", "cpi_yoy",
+    ]
+    sensitivity: dict[str, float] = {}
+    for col in slider_cols:
+        row = conn.execute(
+            f"SELECT MIN(probability), MAX(probability) FROM scenario_grid "
+            f"GROUP BY {col} ORDER BY MAX(probability) - MIN(probability) "
+            f"DESC LIMIT 1"
+        ).fetchone()
+        if row:
+            sensitivity[col] = round(row[1] - row[0], 4)
+
+    most_sensitive: str = max(sensitivity, key=sensitivity.get)  # type: ignore[arg-type]
+
+    context_text: str = (
+        f"Scenario Explorer:\n"
+        f"- Baseline risk (current features): {baseline:.4f}\n"
+        f"- Grid range: {grid_min:.6f} to {grid_max:.6f}\n"
+        f"- Grid size: {grid_count} scenarios\n"
+        f"- Most sensitive input: {most_sensitive}\n"
+        f"- Sensitivity by slider: "
+        + ", ".join(f"{k}={v:.4f}" for k, v in sensitivity.items())
+    )
+
+    return {
+        "context_text": context_text,
+        "data_points": {
+            "baseline": round(baseline, 4),
+            "grid_min": round(grid_min, 6),
+            "grid_max": round(grid_max, 6),
+            "grid_count": grid_count,
+            "most_sensitive": most_sensitive,
+            "sensitivity": sensitivity,
+        },
+    }
+
+
+def _context_deep_divergence(conn: sqlite3.Connection) -> dict[str, Any]:
+    """Build data context for the deep dive employment divergence insight.
+
+    Focuses on post-ChatGPT window.
+
+    Args:
+        conn: SQLite database connection.
+
+    Returns:
+        Dict with 'context_text' and 'data_points'.
+    """
+    latest: str = _latest_month(conn, "USINFO")
+    chatgpt: str = CHATGPT_LAUNCH
+
+    info_pct: float = _compute_pct_of_start(
+        conn, "USINFO", chatgpt, latest, per_capita=True,
+    )
+    trades_pct: float = _compute_pct_of_start(
+        conn, "CES2023800001", chatgpt, latest, per_capita=True,
+    )
+    info_chg: float = _compute_change(
+        conn, "USINFO", chatgpt, latest, per_capita=True,
+    )
+    trades_chg: float = _compute_change(
+        conn, "CES2023800001", chatgpt, latest, per_capita=True,
+    )
+    gap: float = round(trades_pct - info_pct, 2)
+
+    context_text: str = (
+        f"Deep Dive: Employment Divergence (post-ChatGPT):\n"
+        f"- Info per-capita index: {info_pct}% of Nov 2022\n"
+        f"- Trades per-capita index: {trades_pct}% of Nov 2022\n"
+        f"- Info change: {info_chg:+.2f}%\n"
+        f"- Trades change: {trades_chg:+.2f}%\n"
+        f"- Gap (trades - info): {gap:+.2f}pp\n"
+        f"Focus on: what changed after Nov 2022?"
+    )
+
+    return {
+        "context_text": context_text,
+        "data_points": {
+            "info_pct": round(info_pct, 2),
+            "trades_pct": round(trades_pct, 2),
+            "info_change": round(info_chg, 2),
+            "trades_change": round(trades_chg, 2),
+            "gap": gap,
+        },
+    }
+
+
+def _context_deep_energy(conn: sqlite3.Connection) -> dict[str, Any]:
+    """Build data context for the deep dive energy paradox insight.
+
+    Focuses on post-ChatGPT window.
+
+    Args:
+        conn: SQLite database connection.
+
+    Returns:
+        Dict with 'context_text' and 'data_points'.
+    """
+    latest: str = _latest_month(conn, "IPG2211S")
+    chatgpt: str = CHATGPT_LAUNCH
+
+    power_pct: float = _compute_pct_of_start(
+        conn, "IPG2211S", chatgpt, latest,
+    )
+    info_pct: float = _compute_pct_of_start(
+        conn, "USINFO", chatgpt, latest,
+    )
+    power_chg: float = _compute_change(conn, "IPG2211S", chatgpt, latest)
+    info_chg: float = _compute_change(conn, "USINFO", chatgpt, latest)
+    gap: float = round(power_pct - info_pct, 2)
+
+    context_text: str = (
+        f"Deep Dive: Energy Paradox (post-ChatGPT):\n"
+        f"- Power output index: {power_pct}% of Nov 2022\n"
+        f"- Info employment index: {info_pct}% of Nov 2022\n"
+        f"- Power change: {power_chg:+.2f}%\n"
+        f"- Info change: {info_chg:+.2f}%\n"
+        f"- Power-info gap: {gap:+.2f}pp\n"
+        f"Focus on: power demand rising while info employment falls."
+    )
+
+    return {
+        "context_text": context_text,
+        "data_points": {
+            "power_pct": round(power_pct, 2),
+            "info_pct": round(info_pct, 2),
+            "power_change": round(power_chg, 2),
+            "info_change": round(info_chg, 2),
+            "gap": gap,
+        },
+    }
+
+
+def _context_deep_synthesis_charts(
+    conn: sqlite3.Connection,
+) -> dict[str, Any]:
+    """Build data context for the deep dive synthesis insight.
+
+    Connects employment divergence and energy paradox.
+
+    Args:
+        conn: SQLite database connection.
+
+    Returns:
+        Dict with 'context_text' and 'data_points'.
+    """
+    latest: str = _latest_month(conn, "USINFO")
+    chatgpt: str = CHATGPT_LAUNCH
+
+    info_pct: float = _compute_pct_of_start(
+        conn, "USINFO", chatgpt, latest, per_capita=True,
+    )
+    trades_pct: float = _compute_pct_of_start(
+        conn, "CES2023800001", chatgpt, latest, per_capita=True,
+    )
+    power_pct: float = _compute_pct_of_start(
+        conn, "IPG2211S", chatgpt, latest,
+    )
+    divergence_gap: float = round(trades_pct - info_pct, 2)
+    power_info_gap: float = round(power_pct - info_pct, 2)
+    both_widening: bool = divergence_gap > 0 and power_info_gap > 0
+
+    context_text: str = (
+        f"Deep Dive Synthesis (post-ChatGPT):\n"
+        f"- Trades-info divergence: {divergence_gap:+.2f}pp\n"
+        f"- Power-info gap: {power_info_gap:+.2f}pp\n"
+        f"- Both gaps widening: {'Yes' if both_widening else 'No'}\n"
+        f"- Info per-capita: {info_pct}% of Nov 2022\n"
+        f"- Trades per-capita: {trades_pct}% of Nov 2022\n"
+        f"- Power index: {power_pct}% of Nov 2022\n"
+        f"Connect the two charts into a single AI structural impact "
+        f"narrative."
+    )
+
+    return {
+        "context_text": context_text,
+        "data_points": {
+            "divergence_gap": divergence_gap,
+            "power_info_gap": power_info_gap,
+            "both_widening": both_widening,
+            "info_pct": round(info_pct, 2),
+            "trades_pct": round(trades_pct, 2),
+            "power_pct": round(power_pct, 2),
+        },
+    }
+
+
 def _context_synthesis(conn: sqlite3.Connection) -> dict[str, Any]:
     """Build cross-metric synthesis context for the deep dive insight.
 
@@ -1348,6 +2207,109 @@ def _context_synthesis(conn: sqlite3.Connection) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 INSIGHT_SLICES: list[dict[str, Any]] = [
+    {
+        "metric_key": "dashboard_intro",
+        "insight_type": "trend",
+        "context_fn": _context_dashboard_intro,
+        "claims_fn": _claims_dashboard_intro,
+        "analysis_prompt": (
+            "Ignore the 2-3 sentence instruction. Write two substantial "
+            "paragraphs (8-10 sentences total) suitable for the top of "
+            "an executive dashboard.\n\n"
+            "FIRST PARAGRAPH — Synthesis: Weave the headline numbers "
+            "into a narrative that tells a coherent story. Do not list "
+            "stats one after another. Connect them: what does "
+            "unemployment at this level, combined with this GDP growth "
+            "rate and this yield spread, actually mean for the economy "
+            "right now? Compare to historical norms where useful. A "
+            "C-suite reader should finish this paragraph understanding "
+            "the macro landscape without looking at a single chart.\n\n"
+            "SECOND PARAGRAPH — So What: Answer 'what should we watch "
+            "and why does it matter.' Identify the key tension or risk "
+            "in the data, explain what would change your outlook (e.g., "
+            "if the yield curve inverts, if unemployment crosses a "
+            "threshold), and give a forward-looking read. This paragraph "
+            "should feel like actionable intelligence, not a summary."
+        ),
+    },
+    {
+        "metric_key": "overview",
+        "insight_type": "trend",
+        "context_fn": _context_overview,
+        "claims_fn": _claims_overview,
+        "analysis_prompt": (
+            "Synthesize the 5 headline indicators into a cohesive "
+            "2-sentence snapshot. Are they pointing in the same "
+            "direction or diverging?"
+        ),
+    },
+    {
+        "metric_key": "recession_risk",
+        "insight_type": "trend",
+        "context_fn": _context_recession_risk,
+        "claims_fn": _claims_recession_risk,
+        "analysis_prompt": (
+            "Interpret the recession risk timeline. Is risk rising, "
+            "falling, or stable? How does the current level compare "
+            "to a year ago?"
+        ),
+    },
+    {
+        "metric_key": "feature_snapshot",
+        "insight_type": "trend",
+        "context_fn": _context_feature_snapshot,
+        "claims_fn": _claims_feature_snapshot,
+        "analysis_prompt": (
+            "Explain what the feature snapshot says about current "
+            "recession risk. Which signals are most concerning and "
+            "which are reassuring?"
+        ),
+    },
+    {
+        "metric_key": "scenario_explorer",
+        "insight_type": "comparison",
+        "context_fn": _context_scenario_explorer,
+        "claims_fn": _claims_scenario_explorer,
+        "analysis_prompt": (
+            "Describe what the scenario explorer reveals about "
+            "recession sensitivity. Which input has the strongest "
+            "effect on risk?"
+        ),
+    },
+    {
+        "metric_key": "deep_divergence",
+        "insight_type": "comparison",
+        "context_fn": _context_deep_divergence,
+        "claims_fn": _claims_deep_divergence,
+        "analysis_prompt": (
+            "Narrate the employment divergence between info and "
+            "trades sectors. Focus on the post-ChatGPT period. "
+            "Do not repeat the full-range trend. What changed "
+            "after Nov 2022?"
+        ),
+    },
+    {
+        "metric_key": "deep_energy",
+        "insight_type": "correlation",
+        "context_fn": _context_deep_energy,
+        "claims_fn": _claims_deep_energy,
+        "analysis_prompt": (
+            "Explain the energy paradox: power demand rising while "
+            "info employment falls. Focus on the post-ChatGPT "
+            "period. What does this suggest about AI infrastructure?"
+        ),
+    },
+    {
+        "metric_key": "deep_synthesis_charts",
+        "insight_type": "comparison",
+        "context_fn": _context_deep_synthesis_charts,
+        "claims_fn": _claims_deep_synthesis_charts,
+        "analysis_prompt": (
+            "Connect the employment divergence and energy paradox "
+            "into a single narrative about AI's structural impact "
+            "on work."
+        ),
+    },
     {
         "metric_key": "T10Y2Y_UNRATE",
         "insight_type": "correlation",

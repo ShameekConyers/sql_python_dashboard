@@ -1169,6 +1169,99 @@ if last_updated:
 
 render_ai_insight_block("dashboard_intro", "trend", use_full)
 
+# Inline glossary of economic terms
+GLOSSARY_TERMS: list[tuple[str, str]] = [
+    (
+        "U3 (Official Unemployment Rate)",
+        "Percentage of the labor force that is jobless and actively seeking "
+        "work. The most commonly cited unemployment figure.",
+    ),
+    (
+        "U6 (Broad Unemployment Rate)",
+        "Includes U3 plus discouraged workers and those working part-time "
+        "for economic reasons. A wider measure of labor market slack.",
+    ),
+    (
+        "U6-U3 Gap",
+        "The difference between U6 and U3. A widening gap signals rising "
+        "underemployment even when headline unemployment looks stable.",
+    ),
+    (
+        "Yield Curve / Yield Spread (10Y-2Y)",
+        "The difference between 10-year and 2-year Treasury yields. "
+        "Normally positive; when investors demand more for short-term "
+        "risk, it can invert.",
+    ),
+    (
+        "Yield Curve Inversion",
+        "When the 10Y-2Y spread turns negative. Historically precedes "
+        "recessions by 6-18 months, though timing varies.",
+    ),
+    (
+        "GDP (Gross Domestic Product)",
+        "Total value of goods and services produced in the U.S. The "
+        "broadest measure of economic output.",
+    ),
+    (
+        "Annualized Growth Rate",
+        "A quarterly GDP change scaled to a full year. A 0.5% quarterly "
+        "gain reports as roughly 2% annualized.",
+    ),
+    (
+        "CPI (Consumer Price Index)",
+        "Tracks the average price change for a basket of consumer goods "
+        "and services. The primary inflation gauge.",
+    ),
+    (
+        "YoY (Year-over-Year)",
+        "Compares a value to the same month one year earlier. Removes "
+        "seasonal effects for cleaner trend reading.",
+    ),
+    (
+        "MoM (Month-over-Month)",
+        "Compares a value to the prior month. More volatile than YoY "
+        "but captures turning points faster.",
+    ),
+    (
+        "Per-Capita Normalization",
+        "Dividing employment counts by working-age population (CNP16OV). "
+        "Controls for population growth so sector trends reflect real "
+        "demand shifts, not demographic drift.",
+    ),
+    (
+        "NBER Recession",
+        "A period of significant economic decline as designated by the "
+        "National Bureau of Economic Research. The official U.S. "
+        "recession arbiter.",
+    ),
+    (
+        "ARIMA / COVID Adjustment",
+        "An ARIMA model trained on pre-COVID data fills in a "
+        "counterfactual for the Mar 2020 - Jan 2022 shock window. "
+        "Prevents the COVID outlier from distorting trend calculations.",
+    ),
+    (
+        "Recession Risk Score",
+        "The model's output (0-1) indicating how closely current "
+        "conditions resemble historical pre-recession patterns. Not a "
+        "calibrated probability. Higher = more recession-like.",
+    ),
+    (
+        "FRED (Federal Reserve Economic Data)",
+        "A database of 800,000+ economic time series maintained by the "
+        "Federal Reserve Bank of St. Louis. The data source for this "
+        "dashboard.",
+    ),
+]
+
+with st.expander("Glossary of Economic Terms"):
+    g_col1, g_col2 = st.columns(2)
+    midpoint: int = (len(GLOSSARY_TERMS) + 1) // 2
+    for i, (term, definition) in enumerate(GLOSSARY_TERMS):
+        target = g_col1 if i < midpoint else g_col2
+        with target:
+            st.markdown(f"**{term}**  \n{definition}")
+
 st.divider()
 
 
@@ -1255,8 +1348,8 @@ with row1[2]:
     st.metric("CPI Inflation (YoY)", f"{cpi_yoy:.1f}%", cpi_date[:7] if cpi_date else "")
     _render_sparkline("CPIAUCSL")
 
-# Row 2: Employment metrics
-row2 = st.columns(3)
+# Row 2: Employment metrics (2 columns since only 2 metrics)
+row2 = st.columns(2)
 with row2[0]:
     st.metric("Unemployment (U3)", f"{unrate_val:.1f}%", f"{unrate_delta:+.1f}pp MoM")
     _render_sparkline("UNRATE")

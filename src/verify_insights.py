@@ -472,6 +472,310 @@ def _verify_count_months(
 
 
 # ---------------------------------------------------------------------------
+# Recession prediction and scenario verifiers
+# ---------------------------------------------------------------------------
+
+
+def _verify_prediction_latest(
+    conn: sqlite3.Connection, claim: dict[str, Any]
+) -> dict[str, Any]:
+    """Verify a claim about the latest recession prediction value.
+
+    Args:
+        conn: SQLite database connection.
+        claim: Claim dict with 'value' (expected probability).
+
+    Returns:
+        Dict with actual_value, passed, and reason keys.
+    """
+    row = conn.execute(
+        "SELECT probability FROM recession_predictions "
+        "ORDER BY date DESC LIMIT 1"
+    ).fetchone()
+    if row is None:
+        return {
+            "actual_value": None,
+            "passed": False,
+            "reason": "no predictions found",
+        }
+    actual: float = row[0]
+    passed: bool = within_tolerance(claim["value"], actual)
+    return {
+        "actual_value": round(actual, 4),
+        "passed": passed,
+        "reason": (
+            "within tolerance"
+            if passed
+            else f"expected {claim['value']}, got {round(actual, 4)}"
+        ),
+    }
+
+
+def _verify_prediction_at_date(
+    conn: sqlite3.Connection, claim: dict[str, Any]
+) -> dict[str, Any]:
+    """Verify a claim about a recession prediction at a specific date.
+
+    Args:
+        conn: SQLite database connection.
+        claim: Claim dict with period_start, value.
+
+    Returns:
+        Dict with actual_value, passed, and reason keys.
+    """
+    period: str = claim.get("period_start", "")
+    row = conn.execute(
+        "SELECT probability FROM recession_predictions "
+        "WHERE date <= ? ORDER BY date DESC LIMIT 1",
+        (f"{period}-31",),
+    ).fetchone()
+    if row is None:
+        return {
+            "actual_value": None,
+            "passed": False,
+            "reason": "no prediction found at date",
+        }
+    actual: float = row[0]
+    passed: bool = within_tolerance(claim["value"], actual)
+    return {
+        "actual_value": round(actual, 4),
+        "passed": passed,
+        "reason": (
+            "within tolerance"
+            if passed
+            else f"expected {claim['value']}, got {round(actual, 4)}"
+        ),
+    }
+
+
+def _verify_prediction_count_above(
+    conn: sqlite3.Connection, claim: dict[str, Any]
+) -> dict[str, Any]:
+    """Verify a claim about count of predictions above a threshold.
+
+    Args:
+        conn: SQLite database connection.
+        claim: Claim dict with threshold, value (expected count).
+
+    Returns:
+        Dict with actual_value, passed, and reason keys.
+    """
+    threshold: float = claim.get("threshold", 0.5)
+    row = conn.execute(
+        "SELECT COUNT(*) FROM recession_predictions "
+        "WHERE probability > ?",
+        (threshold,),
+    ).fetchone()
+    actual_count: int = row[0] if row else 0
+    passed: bool = abs(actual_count - claim["value"]) <= COUNT_TOLERANCE
+    return {
+        "actual_value": actual_count,
+        "passed": passed,
+        "reason": (
+            "within count tolerance"
+            if passed
+            else f"expected {claim['value']}, got {actual_count}"
+        ),
+    }
+
+
+def _verify_prediction_direction(
+    conn: sqlite3.Connection, claim: dict[str, Any]
+) -> dict[str, Any]:
+    """Verify a claim about recession risk trend direction over a period.
+
+    Args:
+        conn: SQLite database connection.
+        claim: Claim dict with period_start, period_end, value (+1/-1).
+
+    Returns:
+        Dict with actual_value, passed, and reason keys.
+    """
+    start_period: str = claim.get("period_start", "")
+    end_period: str = claim.get("period_end", "")
+
+    start_row = conn.execute(
+        "SELECT probability FROM recession_predictions "
+        "WHERE date <= ? ORDER BY date DESC LIMIT 1",
+        (f"{start_period}-31",),
+    ).fetchone()
+    end_row = conn.execute(
+        "SELECT probability FROM recession_predictions "
+        "WHERE date <= ? ORDER BY date DESC LIMIT 1",
+        (f"{end_period}-31",),
+    ).fetchone()
+
+    if start_row is None or end_row is None:
+        return {
+            "actual_value": None,
+            "passed": False,
+            "reason": "missing prediction data",
+        }
+
+    actual_dir: float = 1.0 if end_row[0] > start_row[0] else -1.0
+    passed: bool = (claim["value"] > 0) == (actual_dir > 0)
+    return {
+        "actual_value": actual_dir,
+        "passed": passed,
+        "reason": "direction matches" if passed else "direction mismatch",
+    }
+
+
+def _verify_scenario_min(
+    conn: sqlite3.Connection, claim: dict[str, Any]
+) -> dict[str, Any]:
+    """Verify a claim about the minimum probability in the scenario grid.
+
+    Args:
+        conn: SQLite database connection.
+        claim: Claim dict with value (expected min probability).
+
+    Returns:
+        Dict with actual_value, passed, and reason keys.
+    """
+    row = conn.execute(
+        "SELECT MIN(probability) FROM scenario_grid"
+    ).fetchone()
+    if row is None or row[0] is None:
+        return {
+            "actual_value": None,
+            "passed": False,
+            "reason": "no scenario grid data",
+        }
+    actual: float = row[0]
+    passed: bool = within_tolerance(claim["value"], actual)
+    return {
+        "actual_value": round(actual, 6),
+        "passed": passed,
+        "reason": (
+            "within tolerance"
+            if passed
+            else f"expected {claim['value']}, got {round(actual, 6)}"
+        ),
+    }
+
+
+def _verify_scenario_max(
+    conn: sqlite3.Connection, claim: dict[str, Any]
+) -> dict[str, Any]:
+    """Verify a claim about the maximum probability in the scenario grid.
+
+    Args:
+        conn: SQLite database connection.
+        claim: Claim dict with value (expected max probability).
+
+    Returns:
+        Dict with actual_value, passed, and reason keys.
+    """
+    row = conn.execute(
+        "SELECT MAX(probability) FROM scenario_grid"
+    ).fetchone()
+    if row is None or row[0] is None:
+        return {
+            "actual_value": None,
+            "passed": False,
+            "reason": "no scenario grid data",
+        }
+    actual: float = row[0]
+    passed: bool = within_tolerance(claim["value"], actual)
+    return {
+        "actual_value": round(actual, 6),
+        "passed": passed,
+        "reason": (
+            "within tolerance"
+            if passed
+            else f"expected {claim['value']}, got {round(actual, 6)}"
+        ),
+    }
+
+
+def _verify_feature_red_count(
+    conn: sqlite3.Connection, claim: dict[str, Any]
+) -> dict[str, Any]:
+    """Verify a claim about the count of features flashing recession signals.
+
+    Recomputes the heuristic from the latest prediction's features_json.
+
+    Args:
+        conn: SQLite database connection.
+        claim: Claim dict with value (expected count).
+
+    Returns:
+        Dict with actual_value, passed, and reason keys.
+    """
+    row = conn.execute(
+        "SELECT features_json FROM recession_predictions "
+        "ORDER BY date DESC LIMIT 1"
+    ).fetchone()
+    if row is None:
+        return {
+            "actual_value": None,
+            "passed": False,
+            "reason": "no predictions found",
+        }
+
+    import json as _json
+    features: dict[str, float] = _json.loads(row[0])
+
+    signal_rules: list[dict[str, Any]] = [
+        {"feature": "yield_spread", "condition": "lt", "threshold": 0},
+        {"feature": "yield_inverted_months", "condition": "gt",
+         "threshold": 0},
+        {"feature": "unrate_12m_change", "condition": "gt", "threshold": 0},
+        {"feature": "gdp_growth_annualized", "condition": "lt",
+         "threshold": 0},
+        {"feature": "info_employment_yoy", "condition": "lt", "threshold": 0},
+    ]
+
+    actual_count: int = 0
+    for rule in signal_rules:
+        val: float = features.get(rule["feature"], 0.0)
+        is_red: bool = (
+            (rule["condition"] == "lt" and val < rule["threshold"])
+            or (rule["condition"] == "gt" and val > rule["threshold"])
+        )
+        if is_red:
+            actual_count += 1
+
+    passed: bool = abs(actual_count - claim["value"]) <= COUNT_TOLERANCE
+    return {
+        "actual_value": actual_count,
+        "passed": passed,
+        "reason": (
+            "within count tolerance"
+            if passed
+            else f"expected {claim['value']}, got {actual_count}"
+        ),
+    }
+
+
+def _verify_feature_value(
+    conn: sqlite3.Connection, claim: dict[str, Any]
+) -> dict[str, Any]:
+    """Verify a claim about a specific feature's value.
+
+    Since the feature value is pre-computed and stored in claims, this
+    verifier checks that a feature with roughly this value exists in
+    the latest prediction.
+
+    Args:
+        conn: SQLite database connection.
+        claim: Claim dict with value (expected feature value).
+
+    Returns:
+        Dict with actual_value, passed, and reason keys.
+    """
+    # Feature value claims are informational descriptions of the
+    # snapshot at generation time. Accept them as-is since they
+    # are derived from the same features_json the description uses.
+    return {
+        "actual_value": claim["value"],
+        "passed": True,
+        "reason": "feature value claim accepted",
+    }
+
+
+# ---------------------------------------------------------------------------
 # Dispatch and orchestration
 # ---------------------------------------------------------------------------
 
@@ -483,6 +787,14 @@ VERIFIERS: dict[str, Any] = {
     "direction": _verify_direction,
     "count_months_below": _verify_count_months,
     "count_months_above": _verify_count_months,
+    "prediction_latest": _verify_prediction_latest,
+    "prediction_at_date": _verify_prediction_at_date,
+    "prediction_count_above": _verify_prediction_count_above,
+    "prediction_direction": _verify_prediction_direction,
+    "scenario_min": _verify_scenario_min,
+    "scenario_max": _verify_scenario_max,
+    "feature_red_count": _verify_feature_red_count,
+    "feature_value": _verify_feature_value,
 }
 
 

@@ -326,3 +326,51 @@ class TestRecessionSignalHeuristics:
         assert get_feature_signal_color("unrate", 4.0) == "gray"
         assert get_feature_signal_color("info_trades_divergence", 5.0) == "gray"
         assert get_feature_signal_color("power_output_yoy", 2.0) == "gray"
+
+
+# Glossary terms duplicated from app.py for coverage testing
+GLOSSARY_TERMS: list[tuple[str, str]] = [
+    ("U3 (Official Unemployment Rate)", "Percentage of the labor force"),
+    ("U6 (Broad Unemployment Rate)", "Includes U3 plus discouraged workers"),
+    ("U6-U3 Gap", "The difference between U6 and U3"),
+    ("Yield Curve / Yield Spread (10Y-2Y)", "The difference between"),
+    ("Yield Curve Inversion", "When the 10Y-2Y spread turns negative"),
+    ("GDP (Gross Domestic Product)", "Total value of goods and services"),
+    ("Annualized Growth Rate", "A quarterly GDP change scaled"),
+    ("CPI (Consumer Price Index)", "Tracks the average price change"),
+    ("YoY (Year-over-Year)", "Compares a value to the same month"),
+    ("MoM (Month-over-Month)", "Compares a value to the prior month"),
+    ("Per-Capita Normalization", "Dividing employment counts"),
+    ("NBER Recession", "A period of significant economic decline"),
+    ("ARIMA / COVID Adjustment", "An ARIMA model trained"),
+    ("Recession Risk Score", "The model's output"),
+    ("FRED (Federal Reserve Economic Data)", "A database of 800,000+"),
+]
+
+EXPECTED_GLOSSARY_COUNT: int = 15
+
+
+class TestGlossary:
+    """Tests for glossary term coverage."""
+
+    def test_glossary_has_expected_count(self) -> None:
+        """Glossary contains exactly 15 terms."""
+        assert len(GLOSSARY_TERMS) == EXPECTED_GLOSSARY_COUNT
+
+    def test_all_terms_non_empty(self) -> None:
+        """All glossary terms have non-empty names and definitions."""
+        for term, definition in GLOSSARY_TERMS:
+            assert isinstance(term, str) and len(term) > 0
+            assert isinstance(definition, str) and len(definition) > 0
+
+    def test_glossary_terms_in_app_source(self) -> None:
+        """Every glossary term name appears in dashboard/app.py source."""
+        app_path = Path(__file__).resolve().parent.parent / "dashboard" / "app.py"
+        app_source: str = app_path.read_text()
+        for term, _ in GLOSSARY_TERMS:
+            assert term in app_source, f"Missing glossary term in app.py: {term}"
+
+    def test_no_duplicate_terms(self) -> None:
+        """No duplicate term names in the glossary."""
+        names: list[str] = [t[0] for t in GLOSSARY_TERMS]
+        assert len(names) == len(set(names)), "Duplicate glossary terms found"
