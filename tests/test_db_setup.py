@@ -20,6 +20,9 @@ import db_setup
 
 SCHEMA_SQL: str = (db_setup.SQL_DIR / "01_schema.sql").read_text()
 REFERENCE_SCHEMA_SQL: str = (db_setup.SQL_DIR / "06_reference_schema.sql").read_text()
+HACKERNEWS_SCHEMA_SQL: str = (
+    db_setup.SQL_DIR / "07_hackernews_schema.sql"
+).read_text()
 
 
 @pytest.fixture()
@@ -27,11 +30,12 @@ def mem_conn() -> sqlite3.Connection:
     """Return an in-memory SQLite connection with the schema already created.
 
     Returns:
-        Open connection with all tables (core + reference_docs) ready.
+        Open connection with all tables (core + reference_docs + HN) ready.
     """
     conn: sqlite3.Connection = sqlite3.connect(":memory:")
     conn.executescript(SCHEMA_SQL)
     conn.executescript(REFERENCE_SCHEMA_SQL)
+    conn.executescript(HACKERNEWS_SCHEMA_SQL)
     return conn
 
 
@@ -116,7 +120,7 @@ class TestCreateSchema:
     """Tests for _create_schema."""
 
     def test_creates_all_tables(self) -> None:
-        """Schema creates core tables plus reference_docs (Phase 11)."""
+        """Schema creates core tables, reference_docs, and HN tables."""
         conn: sqlite3.Connection = sqlite3.connect(":memory:")
         # Patch SQL_DIR to use the real schema file
         db_setup._create_schema(conn)
@@ -131,6 +135,8 @@ class TestCreateSchema:
         assert "observations" in tables
         assert "ai_insights" in tables
         assert "reference_docs" in tables
+        assert "hn_stories" in tables
+        assert "hn_sentiment_monthly" in tables
         conn.close()
 
     def test_schema_is_idempotent(self) -> None:
@@ -924,3 +930,350 @@ class TestMain:
         mock_args.return_value = argparse.Namespace(full=True)
         db_setup.main()
         mock_build.assert_called_once_with("full")
+
+
+# ---------------------------------------------------------------------------
+# _load_hn_stories (Phase 13)
+# ---------------------------------------------------------------------------
+
+
+def _hn_story(**overrides: object) -> dict:
+    """Build a minimal scored HN story dict for fixtures."""
+    base: dict = {
+        "story_id": 111,
+        "created_utc": "2023-03-15T10:30:00+00:00",
+        "title": "Example HN title",
+        "text_excerpt": "Some excerpt text.",
+        "score": 100,
+        "num_comments": 25,
+        "url": "https://example.com/post",
+        "hn_permalink": "https://news.ycombinator.com/item?id=111",
+        "sentiment_score": -0.4,
+        "sentiment_label": "negative",
+        "scored_at": "2026-04-16T12:00:00+00:00",
+        "matched_queries": ["layoffs"],
+    }
+    base.update(overrides)
+    return base
+
+
+class TestLoadHnStories:
+    """Tests for ``_load_hn_stories`` (Phase 13)."""
+
+    def test_loads_from_scored_json(
+        self, mem_conn: sqlite3.Connection, tmp_path: Path
+    ) -> None:
+        """A scored JSON file populates hn_stories."""
+        cache: Path = tmp_path / "hn_stories.json"
+        stories: list[dict] = [
+            _hn_story(story_id=1),
+            _hn_story(story_id=2, title="Another"),
+        ]
+        cache.write_text(json.dumps(stories))
+
+        with patch.object(db_setup, "HN_STORIES_PATH", cache):
+            count: int = db_setup._load_hn_stories(mem_conn, "seed")
+
+        assert count == 2
+        rows: list[tuple] = mem_conn.execute(
+            "SELECT story_id, title, sentiment_score, sentiment_label "
+            "FROM hn_stories ORDER BY story_id"
+        ).fetchall()
+        assert rows[0][0] == 1
+        assert rows[1][0] == 2
+        assert rows[0][2] == pytest.approx(-0.4)
+        assert rows[0][3] == "negative"
+
+    def test_skips_missing_file(
+        self, mem_conn: sqlite3.Connection, tmp_path: Path
+    ) -> None:
+        """A missing cache file returns 0 and does not raise."""
+        cache: Path = tmp_path / "hn_stories.json"
+        with patch.object(db_setup, "HN_STORIES_PATH", cache):
+            count: int = db_setup._load_hn_stories(mem_conn, "seed")
+        assert count == 0
+        row_count: int = mem_conn.execute(
+            "SELECT COUNT(*) FROM hn_stories"
+        ).fetchone()[0]
+        assert row_count == 0
+
+    def test_skips_unscored_file(
+        self, mem_conn: sqlite3.Connection, tmp_path: Path
+    ) -> None:
+        """A file missing sentiment_score on any story loads zero rows."""
+        cache: Path = tmp_path / "hn_stories.json"
+        stories: list[dict] = [_hn_story(story_id=1)]
+        stories[0].pop("sentiment_score")
+        cache.write_text(json.dumps(stories))
+
+        with patch.object(db_setup, "HN_STORIES_PATH", cache):
+            count: int = db_setup._load_hn_stories(mem_conn, "seed")
+        assert count == 0
+        row_count: int = mem_conn.execute(
+            "SELECT COUNT(*) FROM hn_stories"
+        ).fetchone()[0]
+        assert row_count == 0
+
+    def test_idempotent_upsert(
+        self, mem_conn: sqlite3.Connection, tmp_path: Path
+    ) -> None:
+        """Running the loader twice does not duplicate rows."""
+        cache: Path = tmp_path / "hn_stories.json"
+        cache.write_text(json.dumps([_hn_story(story_id=42)]))
+        with patch.object(db_setup, "HN_STORIES_PATH", cache):
+            db_setup._load_hn_stories(mem_conn, "seed")
+            db_setup._load_hn_stories(mem_conn, "seed")
+
+        row_count: int = mem_conn.execute(
+            "SELECT COUNT(*) FROM hn_stories"
+        ).fetchone()[0]
+        assert row_count == 1
+
+    def test_month_column_is_yyyy_mm_01(
+        self, mem_conn: sqlite3.Connection, tmp_path: Path
+    ) -> None:
+        """``month`` is derived as ``YYYY-MM-01`` from created_utc."""
+        cache: Path = tmp_path / "hn_stories.json"
+        cache.write_text(
+            json.dumps(
+                [
+                    _hn_story(
+                        story_id=77,
+                        created_utc="2024-07-23T18:15:00+00:00",
+                    )
+                ]
+            )
+        )
+        with patch.object(db_setup, "HN_STORIES_PATH", cache):
+            db_setup._load_hn_stories(mem_conn, "seed")
+
+        month: str = mem_conn.execute(
+            "SELECT month FROM hn_stories WHERE story_id = 77"
+        ).fetchone()[0]
+        assert month == "2024-07-01"
+
+    def test_stores_url_as_null_for_self_posts(
+        self, mem_conn: sqlite3.Connection, tmp_path: Path
+    ) -> None:
+        """Self-post stories (url=None in JSON) become SQL NULL."""
+        cache: Path = tmp_path / "hn_stories.json"
+        cache.write_text(json.dumps([_hn_story(story_id=9, url=None)]))
+        with patch.object(db_setup, "HN_STORIES_PATH", cache):
+            db_setup._load_hn_stories(mem_conn, "seed")
+
+        url: object = mem_conn.execute(
+            "SELECT url FROM hn_stories WHERE story_id = 9"
+        ).fetchone()[0]
+        assert url is None
+
+
+# ---------------------------------------------------------------------------
+# _build_hn_monthly_aggregate (Phase 13)
+# ---------------------------------------------------------------------------
+
+
+class TestBuildHnMonthlyAggregate:
+    """Tests for ``_build_hn_monthly_aggregate`` (Phase 13)."""
+
+    def _load_stories(
+        self,
+        mem_conn: sqlite3.Connection,
+        tmp_path: Path,
+        stories: list[dict],
+    ) -> None:
+        """Helper: write stories to a cache and call the loader."""
+        cache: Path = tmp_path / "hn_stories.json"
+        cache.write_text(json.dumps(stories))
+        with patch.object(db_setup, "HN_STORIES_PATH", cache):
+            db_setup._load_hn_stories(mem_conn, "seed")
+
+    def test_groups_by_month(
+        self, mem_conn: sqlite3.Connection, tmp_path: Path
+    ) -> None:
+        """Stories from two months produce two aggregate rows."""
+        self._load_stories(
+            mem_conn,
+            tmp_path,
+            [
+                _hn_story(
+                    story_id=1,
+                    created_utc="2023-03-01T00:00:00+00:00",
+                    sentiment_score=-0.5,
+                    title="tech layoffs again",
+                ),
+                _hn_story(
+                    story_id=2,
+                    created_utc="2023-03-15T00:00:00+00:00",
+                    sentiment_score=-0.3,
+                    title="Something ordinary",
+                ),
+                _hn_story(
+                    story_id=3,
+                    created_utc="2023-04-02T00:00:00+00:00",
+                    sentiment_score=0.1,
+                    title="Hiring surge",
+                ),
+            ],
+        )
+        count: int = db_setup._build_hn_monthly_aggregate(mem_conn)
+        assert count == 2
+
+        rows: list[tuple] = mem_conn.execute(
+            "SELECT month, story_count FROM hn_sentiment_monthly "
+            "ORDER BY month"
+        ).fetchall()
+        assert rows == [("2023-03-01", 2), ("2023-04-01", 1)]
+
+    def test_layoff_story_count_matches_manual(
+        self, mem_conn: sqlite3.Connection, tmp_path: Path
+    ) -> None:
+        """Layoff-keyword matches count toward layoff_story_count."""
+        self._load_stories(
+            mem_conn,
+            tmp_path,
+            [
+                _hn_story(
+                    story_id=1,
+                    title="Big Co layoffs continue",
+                    text_excerpt="",
+                    created_utc="2023-06-01T00:00:00+00:00",
+                ),
+                _hn_story(
+                    story_id=2,
+                    title="New AI lab launches product",
+                    text_excerpt="",
+                    created_utc="2023-06-02T00:00:00+00:00",
+                ),
+                _hn_story(
+                    story_id=3,
+                    title="Innocuous title",
+                    text_excerpt="Severance packages offered to the team.",
+                    created_utc="2023-06-03T00:00:00+00:00",
+                ),
+            ],
+        )
+        db_setup._build_hn_monthly_aggregate(mem_conn)
+
+        row: tuple = mem_conn.execute(
+            "SELECT story_count, layoff_story_count "
+            "FROM hn_sentiment_monthly WHERE month = '2023-06-01'"
+        ).fetchone()
+        assert row == (3, 2)
+
+    def test_mean_sentiment_is_unweighted_mean(
+        self, mem_conn: sqlite3.Connection, tmp_path: Path
+    ) -> None:
+        """mean_sentiment is the arithmetic mean of sentiment_score."""
+        self._load_stories(
+            mem_conn,
+            tmp_path,
+            [
+                _hn_story(
+                    story_id=1,
+                    sentiment_score=-0.5,
+                    created_utc="2023-08-01T00:00:00+00:00",
+                ),
+                _hn_story(
+                    story_id=2,
+                    sentiment_score=0.1,
+                    created_utc="2023-08-02T00:00:00+00:00",
+                ),
+                _hn_story(
+                    story_id=3,
+                    sentiment_score=0.4,
+                    created_utc="2023-08-03T00:00:00+00:00",
+                ),
+            ],
+        )
+        db_setup._build_hn_monthly_aggregate(mem_conn)
+        mean: float = mem_conn.execute(
+            "SELECT mean_sentiment FROM hn_sentiment_monthly "
+            "WHERE month = '2023-08-01'"
+        ).fetchone()[0]
+        assert mean == pytest.approx(0.0, abs=1e-9)
+
+    def test_idempotent(
+        self, mem_conn: sqlite3.Connection, tmp_path: Path
+    ) -> None:
+        """Running the aggregate twice yields the same row count."""
+        self._load_stories(
+            mem_conn,
+            tmp_path,
+            [
+                _hn_story(
+                    story_id=1,
+                    created_utc="2023-09-01T00:00:00+00:00",
+                )
+            ],
+        )
+        db_setup._build_hn_monthly_aggregate(mem_conn)
+        first: int = mem_conn.execute(
+            "SELECT COUNT(*) FROM hn_sentiment_monthly"
+        ).fetchone()[0]
+
+        db_setup._build_hn_monthly_aggregate(mem_conn)
+        second: int = mem_conn.execute(
+            "SELECT COUNT(*) FROM hn_sentiment_monthly"
+        ).fetchone()[0]
+
+        assert first == second == 1
+
+
+# ---------------------------------------------------------------------------
+# build_database includes HN tables (Phase 13)
+# ---------------------------------------------------------------------------
+
+
+class TestBuildDatabaseIncludesHn:
+    """Smoke test that ``build_database`` populates the HN tables."""
+
+    def test_populates_hn_tables(self, tmp_path: Path) -> None:
+        """End-to-end build loads FRED + HN data when both JSONs exist."""
+        raw_dir: Path = tmp_path / "raw"
+        raw_dir.mkdir()
+
+        fred_payload: dict = {
+            "series_id": "UNRATE",
+            "name": "Unemployment Rate",
+            "category": "labor_market",
+            "frequency": "monthly",
+            "observations": [{"date": "2024-01-01", "value": 3.5}],
+        }
+        (raw_dir / "UNRATE.json").write_text(json.dumps(fred_payload))
+
+        hn_cache: Path = raw_dir / "hn_stories.json"
+        hn_cache.write_text(
+            json.dumps(
+                [
+                    _hn_story(
+                        story_id=1,
+                        created_utc="2023-06-01T00:00:00+00:00",
+                    ),
+                    _hn_story(
+                        story_id=2,
+                        created_utc="2023-07-01T00:00:00+00:00",
+                    ),
+                ]
+            )
+        )
+
+        with (
+            patch.object(db_setup, "DATA_DIR", tmp_path),
+            patch.object(db_setup, "RAW_DIR", raw_dir),
+            patch.object(db_setup, "HN_STORIES_PATH", hn_cache),
+        ):
+            db_path: Path = db_setup.build_database("seed")
+
+        conn: sqlite3.Connection = sqlite3.connect(db_path)
+        try:
+            story_count: int = conn.execute(
+                "SELECT COUNT(*) FROM hn_stories"
+            ).fetchone()[0]
+            monthly_count: int = conn.execute(
+                "SELECT COUNT(*) FROM hn_sentiment_monthly"
+            ).fetchone()[0]
+        finally:
+            conn.close()
+
+        assert story_count == 2
+        assert monthly_count == 2

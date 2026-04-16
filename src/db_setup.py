@@ -16,6 +16,7 @@ import sys
 from datetime import date
 from pathlib import Path
 
+from hackernews_config import LAYOFF_KEYWORDS
 from series_config import SERIES, SERIES_IDS, SeriesInfo
 
 PROJECT_ROOT: Path = Path(__file__).resolve().parent.parent
@@ -24,6 +25,9 @@ RAW_DIR: Path = PROJECT_ROOT / "data" / "raw"
 DATA_DIR: Path = PROJECT_ROOT / "data"
 SCHOLARLY_DIR: Path = PROJECT_ROOT / "data" / "reference_sources" / "scholarly"
 """Directory holding curated scholarly reference JSON fixtures (Phase 12)."""
+
+HN_STORIES_PATH: Path = PROJECT_ROOT / "data" / "raw" / "hn_stories.json"
+"""Cache of scored Hacker News stories written by ``sentiment_score.py``."""
 
 logging.basicConfig(
     level=logging.INFO,
@@ -72,7 +76,11 @@ def _create_schema(conn: sqlite3.Connection) -> None:
     Args:
         conn: Open SQLite connection.
     """
-    for schema_filename in ("01_schema.sql", "06_reference_schema.sql"):
+    for schema_filename in (
+        "01_schema.sql",
+        "06_reference_schema.sql",
+        "07_hackernews_schema.sql",
+    ):
         schema_path: Path = SQL_DIR / schema_filename
         schema_sql: str = schema_path.read_text()
         conn.executescript(schema_sql)
@@ -477,6 +485,161 @@ def _load_scholarly_docs(conn: sqlite3.Connection, mode: str) -> int:
     return loaded
 
 
+_HN_REQUIRED_FIELDS: tuple[str, ...] = (
+    "story_id",
+    "created_utc",
+    "title",
+    "text_excerpt",
+    "score",
+    "num_comments",
+    "hn_permalink",
+    "sentiment_score",
+    "sentiment_label",
+)
+"""Per-story keys every row in the HN cache must provide at load time."""
+
+
+def _load_hn_stories(conn: sqlite3.Connection, mode: str) -> int:
+    """Load scored HN stories from data/raw/hn_stories.json.
+
+    Reads the single cached JSON, validates required fields (including
+    ``sentiment_score`` and ``sentiment_label`` -- requires
+    ``sentiment_score.py`` has run), and upserts into ``hn_stories``
+    via ``INSERT OR REPLACE`` on ``story_id``. A missing cache file
+    logs an info message and returns 0. An unscored cache (any story
+    missing ``sentiment_score``) logs a warning and skips the entire
+    file rather than partially loading.
+
+    Args:
+        conn: Open SQLite connection.
+        mode: Either 'seed' or 'full'. Reserved for future filtering.
+
+    Returns:
+        Count of rows inserted or replaced.
+    """
+    _ = mode  # reserved for future filtering
+
+    if not HN_STORIES_PATH.exists():
+        logger.info(
+            "No HN JSON at %s - skipping hn_stories load", HN_STORIES_PATH
+        )
+        return 0
+
+    with HN_STORIES_PATH.open() as f:
+        stories: list[dict] = json.load(f)
+
+    if not stories:
+        logger.info("HN JSON is empty - nothing to load")
+        return 0
+
+    # Reject unscored files outright rather than partial-loading.
+    for story in stories:
+        if "sentiment_score" not in story or "sentiment_label" not in story:
+            logger.warning(
+                "HN JSON contains unscored stories - run sentiment_score.py "
+                "before db_setup.py. Skipping hn_stories load."
+            )
+            return 0
+
+    inserted: int = 0
+    for story in stories:
+        missing: list[str] = [k for k in _HN_REQUIRED_FIELDS if k not in story]
+        if missing:
+            logger.warning(
+                "Skipping HN story %s - missing fields: %s",
+                story.get("story_id"),
+                ", ".join(missing),
+            )
+            continue
+
+        created_utc: str = str(story["created_utc"])
+        # ISO string is YYYY-MM-DDThh:mm:ss+00:00; first 7 chars are YYYY-MM.
+        month: str = f"{created_utc[:7]}-01"
+
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO hn_stories (
+                story_id, created_utc, month, title, text_excerpt,
+                score, num_comments, url, hn_permalink,
+                sentiment_score, sentiment_label
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                int(story["story_id"]),
+                created_utc,
+                month,
+                str(story["title"]),
+                str(story["text_excerpt"]),
+                int(story["score"]),
+                int(story["num_comments"]),
+                story.get("url"),
+                str(story["hn_permalink"]),
+                float(story["sentiment_score"]),
+                str(story["sentiment_label"]),
+            ),
+        )
+        inserted += 1
+
+    conn.commit()
+    logger.info("Loaded %d hn_stories rows", inserted)
+    return inserted
+
+
+def _build_hn_monthly_aggregate(conn: sqlite3.Connection) -> int:
+    """Populate ``hn_sentiment_monthly`` via a GROUP BY on ``hn_stories``.
+
+    Clears the target table first so repeated calls are idempotent.
+    Aggregates ``mean_sentiment``, ``story_count``, and
+    ``layoff_story_count`` per month. The layoff count is an OR chain
+    of ``LIKE ?`` clauses against both title and excerpt -- SQLite's
+    default ASCII-case-insensitive LIKE is sufficient because both
+    corpus text and keywords are ASCII-normalized.
+
+    Args:
+        conn: Open SQLite connection with ``hn_stories`` populated.
+
+    Returns:
+        Count of aggregate rows inserted.
+    """
+    conn.execute("DELETE FROM hn_sentiment_monthly")
+
+    # Build the parameter-bound LIKE expression:
+    # (title LIKE ? OR text_excerpt LIKE ?) OR ... repeated per keyword.
+    like_clauses: list[str] = []
+    bind_values: list[str] = []
+    for kw in LAYOFF_KEYWORDS:
+        like_pattern: str = f"%{kw}%"
+        like_clauses.append("(title LIKE ? OR text_excerpt LIKE ?)")
+        bind_values.extend([like_pattern, like_pattern])
+    keyword_predicate: str = " OR ".join(like_clauses) if like_clauses else "0"
+
+    # SQL is fully parameterized; keyword_predicate is built from the static
+    # LAYOFF_KEYWORDS tuple in hackernews_config -- no user input enters the
+    # string.
+    sql: str = f"""
+        INSERT INTO hn_sentiment_monthly (
+            month, mean_sentiment, story_count, layoff_story_count
+        )
+        SELECT
+            month,
+            AVG(sentiment_score) AS mean_sentiment,
+            COUNT(*) AS story_count,
+            SUM(CASE WHEN ({keyword_predicate}) THEN 1 ELSE 0 END)
+                AS layoff_story_count
+        FROM hn_stories
+        GROUP BY month
+        ORDER BY month
+    """  # noqa: S608 -- predicate built from static config tuple
+
+    conn.execute(sql, bind_values)
+    inserted: int = conn.execute(
+        "SELECT COUNT(*) FROM hn_sentiment_monthly"
+    ).fetchone()[0]
+    conn.commit()
+    logger.info("Built %d hn_sentiment_monthly rows", inserted)
+    return int(inserted)
+
+
 def _print_summary(conn: sqlite3.Connection, stats: dict[str, dict[str, int]]) -> None:
     """Print a summary of what was loaded into the database.
 
@@ -489,7 +652,14 @@ def _print_summary(conn: sqlite3.Connection, stats: dict[str, dict[str, int]]) -
     print("=" * 70)
 
     # Row counts per table
-    for table in ("series_metadata", "observations", "ai_insights", "reference_docs"):
+    for table in (
+        "series_metadata",
+        "observations",
+        "ai_insights",
+        "reference_docs",
+        "hn_stories",
+        "hn_sentiment_monthly",
+    ):
         row: tuple = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()  # noqa: S608
         print(f"  {table:25s}  {row[0]:>8,} rows")
 
@@ -502,6 +672,13 @@ def _print_summary(conn: sqlite3.Connection, stats: dict[str, dict[str, int]]) -
     ).fetchone()[0]
     print(f"    reference_docs (FRED):   {fred_count:>6,}")
     print(f"    reference_docs (schol.): {scholarly_count:>6,}")
+
+    # HN month coverage (compact, non-essential if table is empty)
+    hn_range: tuple | None = conn.execute(
+        "SELECT MIN(month), MAX(month) FROM hn_sentiment_monthly"
+    ).fetchone()
+    if hn_range and hn_range[0]:
+        print(f"    hn_sentiment_monthly:    {hn_range[0]} -> {hn_range[1]}")
 
     # Date range per series
     print("\n  Date ranges:")
@@ -562,6 +739,8 @@ def build_database(mode: str = "seed") -> Path:
         stats: dict[str, dict[str, int]] = _load_series(conn, series_ids, cutoff_date)
         _load_reference_docs(conn, mode)
         _load_scholarly_docs(conn, mode)
+        _load_hn_stories(conn, mode)
+        _build_hn_monthly_aggregate(conn)
         _print_summary(conn, stats)
     finally:
         conn.close()
