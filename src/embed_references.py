@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import logging
 import re
+import shutil
 import sqlite3
 import sys
 from pathlib import Path
@@ -241,11 +242,66 @@ def _load_model() -> Any:
     return SentenceTransformer(EMBEDDING_MODEL_NAME)
 
 
+def _sweep_orphan_collection_dirs() -> int:
+    """Remove ``data/.chroma/<uuid>/`` dirs for collections no longer live.
+
+    ChromaDB persists each collection's index in a uuid-named subdirectory
+    alongside ``chroma.sqlite3``. Dropping a collection removes its row
+    from ``collections`` but occasionally leaves the on-disk directory
+    behind (observed on Phase 11 -> Phase 12 rebuilds). This helper reads
+    live collection ids directly from ``chroma.sqlite3`` and deletes any
+    uuid directory whose name is not in the live set.
+
+    Only runs when called explicitly (i.e., from a rebuild code path);
+    read-only retrieval never touches the persist-dir layout.
+
+    Returns:
+        Count of directories removed. 0 if ``chroma.sqlite3`` is missing
+        (fresh build) or no orphans were found.
+    """
+    sqlite_path: Path = CHROMA_DIR / "chroma.sqlite3"
+    if not sqlite_path.exists():
+        return 0
+
+    try:
+        conn: sqlite3.Connection = sqlite3.connect(sqlite_path)
+        try:
+            live_ids: set[str] = {
+                str(row[0])
+                for row in conn.execute("SELECT id FROM collections").fetchall()
+            }
+        finally:
+            conn.close()
+    except Exception as e:
+        logger.warning("Sweep read failed (%s); skipping orphan cleanup.", e)
+        return 0
+
+    removed: int = 0
+    for subdir in CHROMA_DIR.iterdir():
+        if not subdir.is_dir():
+            continue
+        if subdir.name in live_ids:
+            continue
+        try:
+            shutil.rmtree(subdir)
+            logger.info("Swept orphan collection dir: %s", subdir.name)
+            removed += 1
+        except Exception as e:
+            logger.warning(
+                "Failed to sweep orphan dir %s (%s); continuing.",
+                subdir.name,
+                e,
+            )
+    return removed
+
+
 def _get_or_create_collection(rebuild: bool) -> Any:
     """Open (or recreate) the ChromaDB collection at ``CHROMA_DIR``.
 
     Args:
-        rebuild: If True, delete and recreate the collection.
+        rebuild: If True, delete and recreate the collection, then sweep
+            any orphan per-collection subdirectories left behind by
+            earlier ``delete_collection`` calls.
 
     Returns:
         A ChromaDB collection handle.
@@ -262,6 +318,8 @@ def _get_or_create_collection(rebuild: bool) -> Any:
         except Exception:
             # Collection may not exist yet on first run
             pass
+        # Only legitimate time to sweep orphan dirs is "about to rebuild."
+        _sweep_orphan_collection_dirs()
 
     return client.get_or_create_collection(name=COLLECTION_NAME)
 

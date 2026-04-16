@@ -266,3 +266,97 @@ class TestRowsFromQueryResult:
         chunks = rag_retrieval._rows_from_query_result(response)
         assert len(chunks) == 1
         assert chunks[0].source_url is None
+
+
+# ---------------------------------------------------------------------------
+# SOCIAL_DOC_TYPE_PREFIX + scholarly floor (Phase 14)
+# ---------------------------------------------------------------------------
+
+
+class TestSocialDocTypePrefix:
+    """Tests for the social doc_type prefix constant (Phase 14)."""
+
+    def test_social_doc_type_prefix_constant_value(self) -> None:
+        """The constant exposes the agreed prefix verbatim."""
+        assert rag_retrieval.SOCIAL_DOC_TYPE_PREFIX == "social:"
+
+
+class TestMinScholarlyIgnoresSocial:
+    """Social chunks must not be counted toward the scholarly floor."""
+
+    def test_min_scholarly_does_not_count_social_chunks(self) -> None:
+        """A first-query result of all-social triggers a scholarly pad query."""
+        social_metadata = [
+            {
+                "doc_id": 100 + i,
+                "series_id": "USINFO",
+                "doc_type": f"social:hn:{9000 + i}",
+                "title": f"Social title {i}",
+                "source_url": f"https://news.ycombinator.com/item?id={9000 + i}",
+                "chunk_index": 0,
+            }
+            for i in range(5)
+        ]
+        first_response: dict = {
+            "ids": [[f"social-{i}" for i in range(5)]],
+            "metadatas": [social_metadata],
+            "documents": [[f"social body {i}" for i in range(5)]],
+            "distances": [[0.1 + 0.01 * i for i in range(5)]],
+        }
+
+        scholarly_metadata = [
+            {
+                "doc_id": 500,
+                "series_id": "USINFO",
+                "doc_type": "scholarly:bea_labor",
+                "title": "BEA Labor Market",
+                "source_url": "https://example.gov/bea",
+                "chunk_index": 0,
+            },
+            {
+                "doc_id": 501,
+                "series_id": "USINFO",
+                "doc_type": "scholarly:cea_erp",
+                "title": "CEA Economic Report",
+                "source_url": "https://example.gov/cea",
+                "chunk_index": 0,
+            },
+            {
+                "doc_id": 502,
+                "series_id": "USINFO",
+                "doc_type": "scholarly:eia_power",
+                "title": "EIA Power",
+                "source_url": "https://example.gov/eia",
+                "chunk_index": 0,
+            },
+        ]
+        pad_response: dict = {
+            "ids": [[f"schol-{i}" for i in range(3)]],
+            "metadatas": [scholarly_metadata],
+            "documents": [[f"scholarly body {i}" for i in range(3)]],
+            "distances": [[0.2, 0.21, 0.22]],
+        }
+
+        fake_collection = MagicMock()
+        fake_collection.query.side_effect = [first_response, pad_response]
+
+        with patch.object(
+            rag_retrieval, "_get_collection", return_value=fake_collection
+        ):
+            result = rag_retrieval.retrieve(
+                "labor market", k=5, series_hint="USINFO", min_scholarly=3
+            )
+
+        # Two queries: the primary (series-hinted) and the scholarly pad.
+        assert fake_collection.query.call_count == 2
+        pad_call = fake_collection.query.call_args_list[1]
+        # Pad query should use the $nin scholarly filter.
+        assert "where" in pad_call.kwargs
+        assert pad_call.kwargs["where"] == {
+            "doc_type": {"$nin": list(rag_retrieval.FRED_DOC_TYPES)}
+        }
+        # Final result contains the original 5 social chunks + 3 scholarly.
+        scholarly_ids = [
+            c.doc_id for c in result if c.doc_type.startswith("scholarly")
+        ]
+        assert set(scholarly_ids) == {500, 501, 502}

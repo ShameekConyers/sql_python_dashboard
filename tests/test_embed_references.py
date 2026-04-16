@@ -254,3 +254,135 @@ class TestCli:
         """main returns 1 when build_index raises FileNotFoundError."""
         mock_build.side_effect = FileNotFoundError("missing")
         assert embed_references.main([]) == 1
+
+
+# ---------------------------------------------------------------------------
+# Orphan collection-dir sweep (Phase 14)
+# ---------------------------------------------------------------------------
+
+
+class TestSweepOrphanCollectionDirs:
+    """Tests for ``_sweep_orphan_collection_dirs`` (Phase 14)."""
+
+    def test_sweeps_orphan_collection_dirs_on_rebuild(
+        self, tmp_path: Path
+    ) -> None:
+        """A real chromadb rebuild plus a leftover uuid dir triggers sweep."""
+        import chromadb
+
+        chroma_dir: Path = tmp_path / ".chroma"
+        chroma_dir.mkdir()
+
+        # Create a real collection so chroma.sqlite3 has the expected shape.
+        client = chromadb.PersistentClient(path=str(chroma_dir))
+        client.get_or_create_collection(name=embed_references.COLLECTION_NAME)
+
+        # Plant a bogus orphan uuid dir alongside the live one.
+        orphan_dir: Path = chroma_dir / "00000000-dead-beef-cafe-000000000000"
+        orphan_dir.mkdir()
+        (orphan_dir / "data_level0.bin").write_bytes(b"stale bytes")
+
+        with patch.object(embed_references, "CHROMA_DIR", chroma_dir):
+            # rebuild=True drops + recreates the collection and sweeps.
+            embed_references._get_or_create_collection(rebuild=True)
+
+        assert not orphan_dir.exists(), "orphan dir should be removed"
+        # Live collection still opens cleanly after the sweep.
+        client2 = chromadb.PersistentClient(path=str(chroma_dir))
+        assert (
+            client2.get_collection(name=embed_references.COLLECTION_NAME)
+            is not None
+        )
+
+    def test_sweep_skips_when_chroma_sqlite3_missing(
+        self, tmp_path: Path
+    ) -> None:
+        """No sqlite file present → no-op, no exception."""
+        chroma_dir: Path = tmp_path / ".chroma"
+        chroma_dir.mkdir()
+        # Plant an innocent directory; without chroma.sqlite3 the sweep
+        # must not touch it.
+        (chroma_dir / "some-uuid").mkdir()
+
+        with patch.object(embed_references, "CHROMA_DIR", chroma_dir):
+            removed: int = embed_references._sweep_orphan_collection_dirs()
+
+        assert removed == 0
+        assert (chroma_dir / "some-uuid").exists()
+
+    def test_sweep_does_nothing_on_non_rebuild(self, tmp_path: Path) -> None:
+        """``_get_or_create_collection(rebuild=False)`` leaves orphans alone."""
+        import chromadb
+
+        chroma_dir: Path = tmp_path / ".chroma"
+        chroma_dir.mkdir()
+
+        client = chromadb.PersistentClient(path=str(chroma_dir))
+        client.get_or_create_collection(name=embed_references.COLLECTION_NAME)
+
+        orphan_dir: Path = chroma_dir / "11111111-dead-beef-cafe-111111111111"
+        orphan_dir.mkdir()
+
+        with patch.object(embed_references, "CHROMA_DIR", chroma_dir):
+            embed_references._get_or_create_collection(rebuild=False)
+
+        assert orphan_dir.exists(), "non-rebuild path must not sweep"
+
+
+# ---------------------------------------------------------------------------
+# build_index picks up social doc_type rows (Phase 14)
+# ---------------------------------------------------------------------------
+
+
+class TestBuildIndexIncludesSocial:
+    """Social reference_docs rows flow through chunking into upsert metadata."""
+
+    def test_build_index_includes_social_doc_type(
+        self, tmp_path: Path
+    ) -> None:
+        """Upsert metadata preserves ``social:hn:<id>`` doc_type values."""
+        import numpy as np
+
+        db_path: Path = tmp_path / "seed.db"
+        conn: sqlite3.Connection = sqlite3.connect(db_path)
+        conn.executescript(
+            """
+            CREATE TABLE reference_docs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                series_id TEXT, doc_type TEXT, title TEXT,
+                content TEXT, source_url TEXT, fetched_at TEXT
+            );
+            INSERT INTO reference_docs
+              (series_id, doc_type, title, content, source_url, fetched_at)
+              VALUES
+              ('USINFO', 'social:hn:12345', 'Layoffs at BigCo',
+               'Layoffs at BigCo: details in the filing.',
+               'https://news.ycombinator.com/item?id=12345',
+               '2024-03-01T00:00:00+00:00');
+            """
+        )
+        conn.commit()
+        conn.close()
+
+        fake_model = MagicMock()
+        fake_model.encode.return_value = np.zeros((1, 4))
+        fake_collection = MagicMock()
+
+        with (
+            patch.object(embed_references, "DATA_DIR", tmp_path),
+            patch.object(embed_references, "CHROMA_DIR", tmp_path / ".chroma"),
+            patch.object(
+                embed_references, "_load_model", return_value=fake_model
+            ),
+            patch.object(
+                embed_references,
+                "_get_or_create_collection",
+                return_value=fake_collection,
+            ),
+        ):
+            embed_references.build_index(mode="seed")
+
+        fake_collection.upsert.assert_called_once()
+        kwargs = fake_collection.upsert.call_args.kwargs
+        assert kwargs["metadatas"][0]["doc_type"] == "social:hn:12345"
+        assert kwargs["metadatas"][0]["series_id"] == "USINFO"

@@ -26,6 +26,14 @@ FRED_DOC_TYPES: tuple[str, ...] = (
 """Non-scholarly doc_type values. Used to build the scholarly-only where
 filter without enumerating scholarly slugs."""
 
+SOCIAL_DOC_TYPE_PREFIX: str = "social:"
+"""Prefix on ``doc_type`` for non-FRED, non-scholarly social refs.
+
+Phase 14 adds the first such corpus (Hacker News stories under
+``social:hn:<story_id>``). Future phases can add other social sources
+under ``social:<source>:<id>`` without changing retrieval filters.
+"""
+
 logger: logging.Logger = logging.getLogger(__name__)
 
 _COLLECTION_CACHE: dict[str, Any] = {}
@@ -238,6 +246,11 @@ def retrieve(
             if len(scholarly_docs) >= min_scholarly:
                 break
             if c.doc_id in seen:
+                continue
+            # Phase 14: the $nin filter excludes FRED types but matches
+            # both scholarly and social rows. Only scholarly chunks
+            # satisfy the floor, so guard the counter explicitly.
+            if not c.doc_type.startswith("scholarly"):
                 continue
             chunks.append(c)
             seen.add(c.doc_id)
