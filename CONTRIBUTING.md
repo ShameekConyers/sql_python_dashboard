@@ -58,18 +58,31 @@ writes `[ref:N]` citations into `ai_insights.citations_json`.
 
 Phase 13 adds a thinned Hacker News corpus as a tech-labor-sentiment
 signal. `src/hackernews_pull.py` uses the public Algolia HN search API
-(no auth, no API key) and caches the top 30 stories per month to
-`data/raw/hn_stories.json`. The window starts at 2022-11-01 (ChatGPT's
-public release). Story text is truncated to 500 characters at
-ingestion. `src/sentiment_score.py` scores each story with
+(no auth, no API key) and caches up to the top 30 stories per month to
+`data/raw/hn_stories.json`. The window starts at 2022-01-01 to match
+the default x-axis start of the dashboard's time-series charts. Story
+text is truncated to 500 characters at ingestion.
+`src/sentiment_score.py` scores each story with
 `cardiffnlp/twitter-roberta-base-sentiment-latest` and writes a
 compound score back to the same JSON. `db_setup.py` loads the scored
 JSON into `hn_stories` and computes `hn_sentiment_monthly` via SQL
-GROUP BY. Nothing in the dashboard or AI insights reads these tables
-in Phase 13; Phase 14 wires them in.
+GROUP BY.
+
+Phase 14 wires HN data into three surfaces: the recession classifier
+gains three HN-derived features (`hn_sentiment_3m_avg`,
+`hn_story_volume_yoy`, `layoff_story_freq`) imputed with
+training-period medians for pre-2022 months; the top 5 stories per
+month are loaded into `reference_docs` under
+`doc_type='social:hn:<story_id>'` so the RAG pipeline embeds and
+retrieves them alongside FRED and scholarly refs; and the Deep Dive tab
+shows a new dual-axis chart overlaying 3-month rolling HN sentiment on
+per-capita info-sector employment with an `hn_labor_sentiment` AI
+insight slice below it. After any HN data refresh,
+`embed_references.py --rebuild` is mandatory to re-index the social
+refs into ChromaDB.
 
 The raw JSON is gitignored under the existing `data/raw/` rule.
-`hn_stories` ships inside `seed.db` (~1,200 rows, thinned excerpts
+`hn_stories` ships inside `seed.db` (~1,500 rows, thinned excerpts
 only). No API credentials or `.env` entries are required.
 
 ## Reference Content
@@ -91,6 +104,14 @@ index (`python src/embed_references.py --db seed --rebuild`). Scholarly
 rows coexist with the FRED triple because their `doc_type` is
 `scholarly:<slug>` rather than one of the three FRED types, which
 sidesteps the UNIQUE `(series_id, doc_type)` constraint.
+
+Phase 14 adds a third source: Hacker News social references under
+`doc_type='social:hn:<story_id>'` with `series_id='USINFO'`. The top 5
+stories per month by score are selected by `db_setup._load_hn_reference_docs`
+and fed into the same embed/retrieve/verify pipeline as FRED and scholarly
+refs. The selection is capped at ~260 rows to keep ChromaDB growth and
+retrieval signal-to-noise within budget. HN sentiment is a self-selected
+tech-practitioner signal, not a representative labor-market measure.
 
 ## Running Tests
 
