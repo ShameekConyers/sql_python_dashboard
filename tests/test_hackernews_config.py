@@ -16,13 +16,13 @@ import hackernews_config as cfg
 class TestCoverageStart:
     """Tests for the coverage-window anchor constants."""
 
-    def test_unix_corresponds_to_2022_11_01_utc(self) -> None:
+    def test_unix_corresponds_to_2022_01_01_utc(self) -> None:
         """COVERAGE_START_UNIX decodes to the expected UTC date."""
         dt: datetime = datetime.fromtimestamp(
             cfg.COVERAGE_START_UNIX, tz=timezone.utc
         )
         assert dt.year == 2022
-        assert dt.month == 11
+        assert dt.month == 1
         assert dt.day == 1
         assert dt.hour == 0
         assert dt.minute == 0
@@ -30,7 +30,7 @@ class TestCoverageStart:
 
     def test_iso_string_matches(self) -> None:
         """The ISO anchor string matches the unix anchor."""
-        assert cfg.COVERAGE_START_ISO == "2022-11-01"
+        assert cfg.COVERAGE_START_ISO == "2022-01-01"
 
 
 class TestLimits:

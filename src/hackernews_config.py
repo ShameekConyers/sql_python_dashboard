@@ -14,15 +14,18 @@ selection filters the corpus down to a seed-friendly size.
 from __future__ import annotations
 
 
-COVERAGE_START_UNIX: int = 1667260800
+COVERAGE_START_UNIX: int = 1640995200
 """Earliest ``created_at_i`` (inclusive) to keep.
 
-Corresponds to 2022-11-01T00:00:00Z. Rounded down from ChatGPT's
-2022-11-30 public launch to the month start so December 2022 buckets
-include launch-week posts.
+Corresponds to 2022-01-01T00:00:00Z. Matches the default x-axis
+start of the dashboard's time-series charts so HN months line up
+with visible FRED data. Captures the ~10 months of pre-ChatGPT
+tech-labor signal (Twitter acquisition aftermath, Meta's first big
+layoff wave in Nov 2022, broader big-tech hiring slowdown) before
+the post-2022-11 AI-impact era.
 """
 
-COVERAGE_START_ISO: str = "2022-11-01"
+COVERAGE_START_ISO: str = "2022-01-01"
 """Human-readable form of ``COVERAGE_START_UNIX``."""
 
 MONTHLY_STORY_LIMIT: int = 30
