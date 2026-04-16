@@ -358,6 +358,260 @@ class TestLoadReferenceDocs:
 
 
 # ---------------------------------------------------------------------------
+# _load_scholarly_docs
+# ---------------------------------------------------------------------------
+
+
+def _scholarly_fixture(**overrides: object) -> dict:
+    """Build a minimal scholarly fixture dict with schema defaults.
+
+    Args:
+        **overrides: Field values to replace in the default fixture.
+
+    Returns:
+        Dict ready to be serialized as one scholarly JSON fixture.
+    """
+    base: dict = {
+        "id": "test_slug",
+        "series_id": "UNRATE",
+        "title": "Test Title",
+        "content": "Test content about unemployment methodology.",
+        "source_url": "https://www.bls.gov/test",
+        "publisher": "BLS",
+        "year": 2025,
+    }
+    base.update(overrides)
+    return base
+
+
+class TestLoadScholarlyDocs:
+    """Tests for _load_scholarly_docs (Phase 12)."""
+
+    def test_happy_path_loads_multiple_fixtures(
+        self,
+        mem_conn: sqlite3.Connection,
+        tmp_path: Path,
+        sample_json_data: dict,
+    ) -> None:
+        """Two valid fixture files produce two scholarly:<slug> rows."""
+        db_setup._insert_metadata(mem_conn, sample_json_data)
+        mem_conn.commit()
+
+        f1: dict = _scholarly_fixture(id="cea_labor", title="CEA labor")
+        f2: dict = _scholarly_fixture(
+            id="bls_methodology",
+            title="BLS methodology",
+            content="BLS unemployment methodology paragraph.",
+        )
+        (tmp_path / "a.json").write_text(json.dumps(f1))
+        (tmp_path / "b.json").write_text(json.dumps(f2))
+
+        with patch.object(db_setup, "SCHOLARLY_DIR", tmp_path):
+            count: int = db_setup._load_scholarly_docs(mem_conn, "seed")
+
+        assert count == 2
+        rows: list[tuple] = mem_conn.execute(
+            "SELECT doc_type, title FROM reference_docs ORDER BY doc_type"
+        ).fetchall()
+        doc_types: list[str] = [r[0] for r in rows]
+        assert doc_types == ["scholarly:bls_methodology", "scholarly:cea_labor"]
+
+    def test_missing_directory_returns_zero(
+        self, mem_conn: sqlite3.Connection, tmp_path: Path
+    ) -> None:
+        """Loader returns 0 without raising if SCHOLARLY_DIR is missing."""
+        missing: Path = tmp_path / "does_not_exist"
+        with patch.object(db_setup, "SCHOLARLY_DIR", missing):
+            count: int = db_setup._load_scholarly_docs(mem_conn, "seed")
+
+        assert count == 0
+        row_count: int = mem_conn.execute(
+            "SELECT COUNT(*) FROM reference_docs"
+        ).fetchone()[0]
+        assert row_count == 0
+
+    def test_missing_required_field_skips(
+        self,
+        mem_conn: sqlite3.Connection,
+        tmp_path: Path,
+        sample_json_data: dict,
+    ) -> None:
+        """Fixture without 'content' is skipped; DB untouched."""
+        db_setup._insert_metadata(mem_conn, sample_json_data)
+        mem_conn.commit()
+
+        bad: dict = _scholarly_fixture()
+        bad.pop("content")
+        (tmp_path / "bad.json").write_text(json.dumps(bad))
+
+        with patch.object(db_setup, "SCHOLARLY_DIR", tmp_path):
+            count: int = db_setup._load_scholarly_docs(mem_conn, "seed")
+
+        assert count == 0
+        row_count: int = mem_conn.execute(
+            "SELECT COUNT(*) FROM reference_docs"
+        ).fetchone()[0]
+        assert row_count == 0
+
+    def test_bad_json_skips_without_raising(
+        self,
+        mem_conn: sqlite3.Connection,
+        tmp_path: Path,
+        sample_json_data: dict,
+    ) -> None:
+        """Malformed JSON file is skipped; loader does not raise."""
+        db_setup._insert_metadata(mem_conn, sample_json_data)
+        mem_conn.commit()
+
+        (tmp_path / "broken.json").write_text("{not valid json")
+        (tmp_path / "good.json").write_text(json.dumps(_scholarly_fixture()))
+
+        with patch.object(db_setup, "SCHOLARLY_DIR", tmp_path):
+            count: int = db_setup._load_scholarly_docs(mem_conn, "seed")
+
+        # The good fixture still loads; the bad one is skipped.
+        assert count == 1
+
+    def test_empty_content_skips(
+        self,
+        mem_conn: sqlite3.Connection,
+        tmp_path: Path,
+        sample_json_data: dict,
+    ) -> None:
+        """Fixture with only whitespace in content is skipped."""
+        db_setup._insert_metadata(mem_conn, sample_json_data)
+        mem_conn.commit()
+
+        (tmp_path / "x.json").write_text(
+            json.dumps(_scholarly_fixture(content="   \n\t"))
+        )
+
+        with patch.object(db_setup, "SCHOLARLY_DIR", tmp_path):
+            count: int = db_setup._load_scholarly_docs(mem_conn, "seed")
+
+        assert count == 0
+
+    def test_unknown_series_skips(
+        self,
+        mem_conn: sqlite3.Connection,
+        tmp_path: Path,
+        sample_json_data: dict,
+    ) -> None:
+        """Fixture referencing a series not in series_metadata is skipped."""
+        db_setup._insert_metadata(mem_conn, sample_json_data)
+        mem_conn.commit()
+
+        (tmp_path / "x.json").write_text(
+            json.dumps(_scholarly_fixture(series_id="NOTASERIES"))
+        )
+
+        with patch.object(db_setup, "SCHOLARLY_DIR", tmp_path):
+            count: int = db_setup._load_scholarly_docs(mem_conn, "seed")
+
+        assert count == 0
+
+    def test_duplicate_slug_skips_second(
+        self,
+        mem_conn: sqlite3.Connection,
+        tmp_path: Path,
+        sample_json_data: dict,
+    ) -> None:
+        """First fixture wins; duplicate slug in a later file is skipped."""
+        db_setup._insert_metadata(mem_conn, sample_json_data)
+        mem_conn.commit()
+
+        (tmp_path / "a.json").write_text(
+            json.dumps(_scholarly_fixture(id="dup", title="first"))
+        )
+        (tmp_path / "b.json").write_text(
+            json.dumps(_scholarly_fixture(id="dup", title="second"))
+        )
+
+        with patch.object(db_setup, "SCHOLARLY_DIR", tmp_path):
+            count: int = db_setup._load_scholarly_docs(mem_conn, "seed")
+
+        assert count == 1
+        titles: list[tuple] = mem_conn.execute(
+            "SELECT title FROM reference_docs WHERE doc_type = 'scholarly:dup'"
+        ).fetchall()
+        # Sorted glob is alphabetical, so a.json wins.
+        assert titles == [("first",)]
+
+    def test_idempotent_upsert(
+        self,
+        mem_conn: sqlite3.Connection,
+        tmp_path: Path,
+        sample_json_data: dict,
+    ) -> None:
+        """Running the loader twice does not duplicate rows."""
+        db_setup._insert_metadata(mem_conn, sample_json_data)
+        mem_conn.commit()
+
+        (tmp_path / "x.json").write_text(json.dumps(_scholarly_fixture()))
+
+        with patch.object(db_setup, "SCHOLARLY_DIR", tmp_path):
+            db_setup._load_scholarly_docs(mem_conn, "seed")
+            db_setup._load_scholarly_docs(mem_conn, "seed")
+
+        row_count: int = mem_conn.execute(
+            "SELECT COUNT(*) FROM reference_docs"
+        ).fetchone()[0]
+        assert row_count == 1
+
+    def test_coexists_with_fred_reference_docs(
+        self,
+        mem_conn: sqlite3.Connection,
+        tmp_path: Path,
+        sample_json_data: dict,
+    ) -> None:
+        """FRED rows and scholarly rows survive side by side for same series."""
+        db_setup._insert_metadata(mem_conn, sample_json_data)
+        mem_conn.commit()
+
+        # FRED-style metadata
+        raw_dir: Path = tmp_path / "raw"
+        raw_dir.mkdir()
+        (raw_dir / "UNRATE_metadata.json").write_text(
+            json.dumps(
+                {
+                    "series_notes": "Official BLS methodology paragraph.",
+                    "release_name": "Employment Situation",
+                    "release_link": "https://www.bls.gov/news.release/empsit.toc.htm",
+                    "release_notes": "Monthly BLS release.",
+                    "category_path": "Labor Market > Unemployment",
+                    "fetched_at": "2026-04-16T12:00:00Z",
+                }
+            )
+        )
+
+        # Scholarly fixture targeting the same series
+        scholarly_dir: Path = tmp_path / "scholarly"
+        scholarly_dir.mkdir()
+        (scholarly_dir / "x.json").write_text(json.dumps(_scholarly_fixture()))
+
+        with (
+            patch.object(db_setup, "RAW_DIR", raw_dir),
+            patch.object(db_setup, "SEED_SERIES", ["UNRATE"]),
+            patch.object(db_setup, "SCHOLARLY_DIR", scholarly_dir),
+        ):
+            db_setup._load_reference_docs(mem_conn, "seed")
+            db_setup._load_scholarly_docs(mem_conn, "seed")
+
+        doc_types: list[str] = [
+            r[0]
+            for r in mem_conn.execute(
+                "SELECT doc_type FROM reference_docs ORDER BY doc_type"
+            ).fetchall()
+        ]
+        assert doc_types == [
+            "category_path",
+            "release_info",
+            "scholarly:test_slug",
+            "series_notes",
+        ]
+
+
+# ---------------------------------------------------------------------------
 # _load_json
 # ---------------------------------------------------------------------------
 

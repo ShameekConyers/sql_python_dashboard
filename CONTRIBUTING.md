@@ -52,6 +52,26 @@ with `sentence-transformers/all-MiniLM-L6-v2`, and persists the collection
 to `data/.chroma/`. `ai_insights.py` then retrieves from that store and
 writes `[ref:N]` citations into `ai_insights.citations_json`.
 
+## Reference Content
+
+`reference_docs` is populated from two sources. The first is per-series
+FRED metadata (series notes, release info, category path) pulled by
+`data_pull.py` and upserted by `db_setup._load_reference_docs`. The
+second is a set of curated JSON fixtures under
+`data/reference_sources/scholarly/`, loaded by
+`db_setup._load_scholarly_docs`. Each scholarly fixture has a stable
+`id`, a FRED `series_id` that must exist in `series_metadata`, a short
+attribution-ready excerpt in `content`, and a `source_url` pointing at
+a US federal-government publication (BEA, BLS, EIA, CRS, CBO, CEA,
+Treasury, GAO). The corpus is intentionally limited to public-domain
+federal-government content so the repo can quote sources verbatim
+without fair-use gymnastics. To add a new source, drop in a new JSON
+file, then rebuild the DB (`python src/db_setup.py`) and the vector
+index (`python src/embed_references.py --db seed --rebuild`). Scholarly
+rows coexist with the FRED triple because their `doc_type` is
+`scholarly:<slug>` rather than one of the three FRED types, which
+sidesteps the UNIQUE `(series_id, doc_type)` constraint.
+
 ## Running Tests
 
 ```bash

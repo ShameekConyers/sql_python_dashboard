@@ -22,6 +22,8 @@ PROJECT_ROOT: Path = Path(__file__).resolve().parent.parent
 SQL_DIR: Path = PROJECT_ROOT / "sql"
 RAW_DIR: Path = PROJECT_ROOT / "data" / "raw"
 DATA_DIR: Path = PROJECT_ROOT / "data"
+SCHOLARLY_DIR: Path = PROJECT_ROOT / "data" / "reference_sources" / "scholarly"
+"""Directory holding curated scholarly reference JSON fixtures (Phase 12)."""
 
 logging.basicConfig(
     level=logging.INFO,
@@ -352,6 +354,129 @@ def _load_reference_docs(conn: sqlite3.Connection, mode: str) -> int:
     return inserted
 
 
+_REQUIRED_SCHOLARLY_FIELDS: tuple[str, ...] = (
+    "id",
+    "series_id",
+    "title",
+    "content",
+    "source_url",
+)
+"""JSON keys that every scholarly fixture file must provide."""
+
+
+def _load_scholarly_docs(conn: sqlite3.Connection, mode: str) -> int:
+    """Load curated scholarly reference_docs rows from JSON fixtures.
+
+    Iterates ``*.json`` files in ``SCHOLARLY_DIR`` in sorted order, validates
+    the schema, and upserts each into ``reference_docs`` with
+    ``doc_type = f"scholarly:{id}"``. The unique ``(series_id, doc_type)``
+    constraint on ``reference_docs`` enforces at most one row per slug per
+    series; ``INSERT OR REPLACE`` lets repeat runs refresh content without
+    duplicating rows.
+
+    Invalid fixtures are skipped with a warning. Empty content, malformed
+    JSON, missing required fields, an unknown ``series_id``, or a duplicate
+    slug within the directory all log and skip rather than raise. A missing
+    directory logs an info-level message and returns ``0``.
+
+    Args:
+        conn: Open SQLite connection.
+        mode: Either ``'seed'`` or ``'full'``. Reserved for future filtering;
+            scholarly rows are mode-agnostic in Phase 12.
+
+    Returns:
+        Count of rows inserted or replaced.
+    """
+    if not SCHOLARLY_DIR.exists():
+        logger.info(
+            "No scholarly fixtures directory at %s - skipping",
+            SCHOLARLY_DIR,
+        )
+        return 0
+
+    known_series: set[str] = {
+        row[0] for row in conn.execute("SELECT series_id FROM series_metadata")
+    }
+    seen_slugs: set[str] = set()
+    loaded: int = 0
+    _ = mode  # reserved for future filtering
+
+    for path in sorted(SCHOLARLY_DIR.glob("*.json")):
+        try:
+            with path.open() as f:
+                fixture: dict = json.load(f)
+        except (OSError, json.JSONDecodeError) as exc:
+            logger.warning(
+                "Skipping scholarly fixture %s - unreadable JSON: %s",
+                path.name,
+                exc,
+            )
+            continue
+
+        missing: list[str] = [
+            key for key in _REQUIRED_SCHOLARLY_FIELDS if not fixture.get(key)
+        ]
+        if missing:
+            logger.warning(
+                "Skipping scholarly fixture %s - missing fields: %s",
+                path.name,
+                ", ".join(missing),
+            )
+            continue
+
+        slug: str = str(fixture["id"]).strip()
+        series_id: str = str(fixture["series_id"]).strip()
+        title: str = str(fixture["title"]).strip()
+        content: str = str(fixture["content"]).strip()
+        source_url: str = str(fixture["source_url"]).strip()
+
+        if not content:
+            logger.warning(
+                "Skipping scholarly fixture %s - empty content after strip",
+                path.name,
+            )
+            continue
+
+        if slug in seen_slugs:
+            logger.warning(
+                "Skipping scholarly fixture %s - duplicate slug '%s'",
+                path.name,
+                slug,
+            )
+            continue
+
+        if series_id not in known_series:
+            logger.warning(
+                "Skipping scholarly fixture %s - unknown series_id '%s'",
+                path.name,
+                series_id,
+            )
+            continue
+
+        seen_slugs.add(slug)
+        doc_type: str = f"scholarly:{slug}"
+        fetched_at: str = date.today().isoformat()
+
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO reference_docs (
+                series_id, doc_type, title, content, source_url, fetched_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (series_id, doc_type, title, content, source_url, fetched_at),
+        )
+        loaded += 1
+        logger.info(
+            "Loaded scholarly fixture %s (series_id=%s)",
+            slug,
+            series_id,
+        )
+
+    conn.commit()
+    logger.info("Loaded %d scholarly reference_docs rows", loaded)
+    return loaded
+
+
 def _print_summary(conn: sqlite3.Connection, stats: dict[str, dict[str, int]]) -> None:
     """Print a summary of what was loaded into the database.
 
@@ -367,6 +492,16 @@ def _print_summary(conn: sqlite3.Connection, stats: dict[str, dict[str, int]]) -
     for table in ("series_metadata", "observations", "ai_insights", "reference_docs"):
         row: tuple = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()  # noqa: S608
         print(f"  {table:25s}  {row[0]:>8,} rows")
+
+    # reference_docs breakdown: FRED triple vs scholarly fixtures
+    scholarly_count: int = conn.execute(
+        "SELECT COUNT(*) FROM reference_docs WHERE doc_type LIKE 'scholarly:%'"
+    ).fetchone()[0]
+    fred_count: int = conn.execute(
+        "SELECT COUNT(*) FROM reference_docs WHERE doc_type NOT LIKE 'scholarly:%'"
+    ).fetchone()[0]
+    print(f"    reference_docs (FRED):   {fred_count:>6,}")
+    print(f"    reference_docs (schol.): {scholarly_count:>6,}")
 
     # Date range per series
     print("\n  Date ranges:")
@@ -426,6 +561,7 @@ def build_database(mode: str = "seed") -> Path:
         _ensure_citations_column(conn)
         stats: dict[str, dict[str, int]] = _load_series(conn, series_ids, cutoff_date)
         _load_reference_docs(conn, mode)
+        _load_scholarly_docs(conn, mode)
         _print_summary(conn, stats)
     finally:
         conn.close()

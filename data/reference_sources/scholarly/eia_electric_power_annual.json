@@ -1,0 +1,9 @@
+{
+  "id": "eia_electric_power_annual",
+  "series_id": "IPG2211S",
+  "title": "EIA Electric Power Annual - Coverage and Classification",
+  "content": "The Electric Power Annual is EIA's comprehensive yearly publication covering U.S. electric power generation, sales, capacity, fuel consumption, emissions, and system performance. The report segments data across multiple producer types and end-use sectors. Producer types include electric utilities and independent power producers, and end-use sectors include the commercial sector and the industrial sector. The coverage extends to U.S. territories as well, including Puerto Rico, American Samoa, Guam, the Northern Mariana Islands, and the Virgin Islands. In EIA's frequently-asked-questions materials, utility-scale electricity generation is defined as electricity generation from power plants with at least one megawatt, or one thousand kilowatts, of total electricity generating capacity. That definition sets a minimum size threshold for the plants that appear in EIA's utility-scale statistics and distinguishes them from smaller distributed generators. The Electric Power Annual presents sales and direct use of electricity to ultimate customers by sector and by provider, net generation by energy source for all sectors, and existing net summer capacity by energy source and producer type. Fuel consumption tables cover coal, petroleum, natural gas, and biomass, and supporting tables cover emissions from energy consumption at conventional power plants along with heat rates and reliability metrics. EIA publishes this framework so that analysts comparing the industrial-production index for electric and gas utilities, or state-level electric load, against physical generation can see which producers are in scope, which fuels are reported, and at what frequency the underlying surveys are collected.",
+  "source_url": "https://www.eia.gov/electricity/annual/",
+  "publisher": "EIA",
+  "year": 2025
+}
