@@ -408,6 +408,10 @@ FEATURE_LABELS: dict[str, str] = {
     "info_trades_divergence": "Info vs Trades Divergence",
     "info_employment_yoy": "Info Employment YoY Growth",
     "power_output_yoy": "Power Output YoY Growth",
+    # Phase 14 — HN-derived features
+    "hn_sentiment_3m_avg": "HN Sentiment (3-mo avg)",
+    "hn_story_volume_yoy": "HN Story Volume YoY",
+    "layoff_story_freq": "Layoff Story Share",
 }
 
 # Heuristics for recession signal coloring (red = recession-like)
@@ -904,6 +908,100 @@ def query_q7(date_min: str, date_max: str, full: bool = False) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=300)
+def query_hn_sentiment_overlay(
+    date_min: str, date_max: str, full: bool = False
+) -> pd.DataFrame:
+    """HN sentiment 3-month rolling avg alongside USINFO per-capita index.
+
+    Drops the trailing partial-month row (current month) so the chart
+    does not show incomplete data. Returns an empty DataFrame when
+    ``hn_sentiment_monthly`` is empty or not yet present.
+
+    Args:
+        date_min: Start date filter.
+        date_max: End date filter.
+        full: Whether to use ``full.db``.
+
+    Returns:
+        DataFrame with columns ``month``, ``mean_sentiment_3m_avg``,
+        ``info_pc_index``. Empty when no HN data falls in the range.
+    """
+    from datetime import datetime, timezone  # noqa: PLC0415
+
+    conn: sqlite3.Connection = get_connection(full)
+    try:
+        # Check table existence first to avoid errors in pre-Phase-13 DBs.
+        exists: int = conn.execute(
+            "SELECT COUNT(*) FROM sqlite_master "
+            "WHERE type='table' AND name='hn_sentiment_monthly'"
+        ).fetchone()[0]
+        if not exists:
+            return pd.DataFrame(
+                columns=["month", "mean_sentiment_3m_avg", "info_pc_index"]
+            )
+
+        hn: pd.DataFrame = pd.read_sql_query(
+            "SELECT SUBSTR(month, 1, 7) AS month, mean_sentiment "
+            "FROM hn_sentiment_monthly ORDER BY month",
+            conn,
+        )
+        if hn.empty:
+            return pd.DataFrame(
+                columns=["month", "mean_sentiment_3m_avg", "info_pc_index"]
+            )
+
+        hn["mean_sentiment_3m_avg"] = (
+            hn["mean_sentiment"].rolling(3, min_periods=1).mean()
+        )
+
+        # USINFO per-capita index using same convention as query_q2.
+        info: pd.DataFrame = pd.read_sql_query(
+            """
+            SELECT
+                SUBSTR(o.date, 1, 7) AS month,
+                o.value_covid_adjusted / p.value_covid_adjusted * 1000 AS info_pc
+            FROM observations o
+            JOIN observations p
+              ON p.series_id = 'CNP16OV'
+              AND SUBSTR(p.date, 1, 7) = SUBSTR(o.date, 1, 7)
+            WHERE o.series_id = 'USINFO'
+            ORDER BY month
+            """,
+            conn,
+        )
+    finally:
+        conn.close()
+
+    if info.empty:
+        return pd.DataFrame(
+            columns=["month", "mean_sentiment_3m_avg", "info_pc_index"]
+        )
+
+    # Index info_pc to 100 at the earliest month in the HN window.
+    hn_start: str = hn["month"].iloc[0]
+    merged: pd.DataFrame = info.merge(hn, on="month", how="inner")
+    if merged.empty:
+        return pd.DataFrame(
+            columns=["month", "mean_sentiment_3m_avg", "info_pc_index"]
+        )
+    base_row = merged.loc[merged["month"] >= hn_start, "info_pc"]
+    base: float = float(base_row.iloc[0]) if not base_row.empty else 1.0
+    merged["info_pc_index"] = merged["info_pc"] / base * 100
+
+    # Mask partial current month.
+    today_ym: str = datetime.now(timezone.utc).strftime("%Y-%m")
+    merged = merged[merged["month"] != today_ym]
+
+    # Apply date range clipping.
+    effective_min: str = max(date_min[:7], hn_start)
+    merged = merged[
+        (merged["month"] >= effective_min) & (merged["month"] <= date_max[:7])
+    ]
+
+    return merged[["month", "mean_sentiment_3m_avg", "info_pc_index"]]
+
+
+@st.cache_data(ttl=300)
 def query_q8(date_min: str, date_max: str, full: bool = False) -> pd.DataFrame:
     """Q8: CPI inflation MoM and YoY.
 
@@ -1224,6 +1322,14 @@ GLOSSARY_TERMS: list[tuple[str, str]] = [
         "GDP (Gross Domestic Product)",
         "Total value of goods and services produced in the U.S. The "
         "broadest measure of economic output.",
+    ),
+    (
+        "Hacker News Sentiment Signal",
+        "Compound sentiment score (-1 to +1) computed by a transformer "
+        "model on titles and excerpts of the top Hacker News stories "
+        "per month tagged AI hiring, layoffs, or careers. Reflects a "
+        "self-selected audience of tech practitioners, not a "
+        "representative labor-market sentiment measure.",
     ),
     (
         "Annualized Growth Rate",
@@ -2061,6 +2167,53 @@ with deep_col2:
         style_figure(fig_deep2, "Power Output vs Info Employment")
         st.plotly_chart(fig_deep2, use_container_width=True, key="deep_q7")
         render_ai_insight_block("deep_energy", "correlation", use_full)
+
+# HN Sentiment Signal (Phase 14)
+st.subheader("AI Labor Market Sentiment Signal")
+st.caption(
+    "Hacker News tech-practitioner sentiment (3-month rolling average) "
+    "alongside per-capita info-sector employment. The sentiment score "
+    "reflects a self-selected audience of tech practitioners, not a "
+    "representative labor-market sentiment measure. HN data starts "
+    "Jan 2022."
+)
+
+df_hn_overlay: pd.DataFrame = query_hn_sentiment_overlay(
+    date_min, date_max, use_full
+)
+if not df_hn_overlay.empty:
+    fig_hn = make_subplots(specs=[[{"secondary_y": True}]])
+
+    fig_hn.add_trace(
+        go.Scatter(
+            x=df_hn_overlay["month"],
+            y=df_hn_overlay["info_pc_index"],
+            name="USINFO Per-Capita Index",
+            line=dict(color="#636EFA"),
+        ),
+        secondary_y=False,
+    )
+    fig_hn.add_trace(
+        go.Scatter(
+            x=df_hn_overlay["month"],
+            y=df_hn_overlay["mean_sentiment_3m_avg"],
+            name="HN Sentiment (3-mo avg)",
+            line=dict(color="#EF553B", dash="dot"),
+        ),
+        secondary_y=True,
+    )
+
+    add_annotated_vline(fig_hn, CHATGPT_LAUNCH)
+    fig_hn.add_hline(
+        y=0, line_dash="dot", line_color="gray", opacity=0.3,
+        secondary_y=True,
+    )
+    fig_hn.update_yaxes(title_text="Per-Capita Index", secondary_y=False)
+    fig_hn.update_yaxes(title_text="Sentiment Score", secondary_y=True)
+    style_figure(fig_hn, "HN Sentiment vs Info Employment")
+    st.plotly_chart(fig_hn, use_container_width=True, key="deep_hn")
+
+render_ai_insight_block("hn_labor_sentiment", "correlation", use_full)
 
 render_ai_insight_block("deep_synthesis_charts", "comparison", use_full)
 
