@@ -1272,8 +1272,242 @@ class TestBuildDatabaseIncludesHn:
             monthly_count: int = conn.execute(
                 "SELECT COUNT(*) FROM hn_sentiment_monthly"
             ).fetchone()[0]
+            social_count: int = conn.execute(
+                "SELECT COUNT(*) FROM reference_docs "
+                "WHERE doc_type LIKE 'social:hn:%'"
+            ).fetchone()[0]
         finally:
             conn.close()
 
         assert story_count == 2
         assert monthly_count == 2
+        # Phase 14: HN reference_docs are loaded alongside the HN tables.
+        assert social_count == 2
+
+
+# ---------------------------------------------------------------------------
+# _load_hn_reference_docs (Phase 14)
+# ---------------------------------------------------------------------------
+
+
+def _insert_hn_story_row(
+    conn: sqlite3.Connection,
+    *,
+    story_id: int,
+    month: str = "2023-06-01",
+    created_utc: str | None = None,
+    score: int = 100,
+    title: str = "Example HN title",
+    text_excerpt: str = "Some excerpt text.",
+    hn_permalink: str | None = None,
+    sentiment_score: float = 0.0,
+    sentiment_label: str = "neutral",
+) -> None:
+    """Insert a single row into ``hn_stories`` for reference_docs tests."""
+    conn.execute(
+        """
+        INSERT INTO hn_stories (
+            story_id, created_utc, month, title, text_excerpt,
+            score, num_comments, url, hn_permalink,
+            sentiment_score, sentiment_label
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            story_id,
+            created_utc or f"{month[:7]}-15T12:00:00+00:00",
+            month,
+            title,
+            text_excerpt,
+            score,
+            0,
+            None,
+            hn_permalink or f"https://news.ycombinator.com/item?id={story_id}",
+            sentiment_score,
+            sentiment_label,
+        ),
+    )
+
+
+class TestLoadHnReferenceDocs:
+    """Tests for ``_load_hn_reference_docs`` (Phase 14)."""
+
+    def test_loads_top_5_per_month(self, mem_conn: sqlite3.Connection) -> None:
+        """Exactly 5 reference_docs rows per month, ordered by score desc."""
+        # Seed 10 stories in one month with distinct descending scores.
+        scores: list[int] = [90, 85, 80, 75, 70, 65, 60, 55, 50, 45]
+        for idx, score in enumerate(scores, start=1):
+            _insert_hn_story_row(
+                mem_conn,
+                story_id=1000 + idx,
+                month="2023-06-01",
+                score=score,
+            )
+
+        count: int = db_setup._load_hn_reference_docs(mem_conn, "seed")
+        assert count == 5
+
+        # The top-5 are the ones with scores 90, 85, 80, 75, 70 → story ids
+        # 1001..1005.
+        selected_ids: list[int] = [
+            int(row[0].split(":")[-1])
+            for row in mem_conn.execute(
+                """
+                SELECT doc_type FROM reference_docs
+                WHERE doc_type LIKE 'social:hn:%'
+                ORDER BY id ASC
+                """
+            ).fetchall()
+        ]
+        assert sorted(selected_ids) == [1001, 1002, 1003, 1004, 1005]
+
+    def test_tie_break_by_story_id_ascending(
+        self, mem_conn: sqlite3.Connection
+    ) -> None:
+        """Ties on score resolve deterministically by story_id ASC."""
+        # Four stories all tied at score=100. Top-5 cap means all four get
+        # picked (not limited by ties), but ordering matters for determinism.
+        for story_id in (205, 103, 407, 301, 509, 111):
+            _insert_hn_story_row(
+                mem_conn,
+                story_id=story_id,
+                month="2023-08-01",
+                score=100,
+            )
+
+        db_setup._load_hn_reference_docs(mem_conn, "seed")
+
+        selected: list[int] = sorted(
+            int(row[0].split(":")[-1])
+            for row in mem_conn.execute(
+                "SELECT doc_type FROM reference_docs "
+                "WHERE doc_type LIKE 'social:hn:%'"
+            ).fetchall()
+        )
+        # Top-5 from {103, 111, 205, 301, 407, 509} sorted ASC = the first 5.
+        assert selected == [103, 111, 205, 301, 407]
+
+    def test_assigns_series_id_usinfo_and_doc_type_prefix(
+        self, mem_conn: sqlite3.Connection
+    ) -> None:
+        """Every row uses series_id='USINFO' and doc_type='social:hn:<id>'."""
+        _insert_hn_story_row(mem_conn, story_id=42, month="2023-01-01")
+        db_setup._load_hn_reference_docs(mem_conn, "seed")
+
+        rows: list[tuple[str, str]] = mem_conn.execute(
+            "SELECT series_id, doc_type FROM reference_docs "
+            "WHERE doc_type LIKE 'social:hn:%'"
+        ).fetchall()
+        assert len(rows) == 1
+        assert rows[0][0] == "USINFO"
+        assert rows[0][1] == "social:hn:42"
+
+    def test_content_concatenates_title_and_excerpt(
+        self, mem_conn: sqlite3.Connection
+    ) -> None:
+        """Story with title + excerpt produces joined content."""
+        _insert_hn_story_row(
+            mem_conn,
+            story_id=7,
+            month="2023-02-01",
+            title="Layoffs announced",
+            text_excerpt="Details in the filing.",
+        )
+        db_setup._load_hn_reference_docs(mem_conn, "seed")
+
+        content: str = mem_conn.execute(
+            "SELECT content FROM reference_docs "
+            "WHERE doc_type = 'social:hn:7'"
+        ).fetchone()[0]
+        assert content == "Layoffs announced\n\nDetails in the filing."
+
+    def test_content_is_title_only_when_excerpt_empty(
+        self, mem_conn: sqlite3.Connection
+    ) -> None:
+        """Link-post story (empty excerpt) stores title only."""
+        _insert_hn_story_row(
+            mem_conn,
+            story_id=8,
+            month="2023-02-01",
+            title="Tech hiring freeze",
+            text_excerpt="",
+        )
+        db_setup._load_hn_reference_docs(mem_conn, "seed")
+
+        content: str = mem_conn.execute(
+            "SELECT content FROM reference_docs "
+            "WHERE doc_type = 'social:hn:8'"
+        ).fetchone()[0]
+        assert content == "Tech hiring freeze"
+
+    def test_uses_hn_permalink_as_source_url(
+        self, mem_conn: sqlite3.Connection
+    ) -> None:
+        """``source_url`` is the raw hn_permalink."""
+        _insert_hn_story_row(
+            mem_conn,
+            story_id=99,
+            month="2023-03-01",
+            hn_permalink="https://news.ycombinator.com/item?id=99",
+        )
+        db_setup._load_hn_reference_docs(mem_conn, "seed")
+
+        url: str = mem_conn.execute(
+            "SELECT source_url FROM reference_docs "
+            "WHERE doc_type = 'social:hn:99'"
+        ).fetchone()[0]
+        assert url == "https://news.ycombinator.com/item?id=99"
+
+    def test_idempotent_upsert(self, mem_conn: sqlite3.Connection) -> None:
+        """Re-running the loader produces the same rows, same count."""
+        _insert_hn_story_row(mem_conn, story_id=1, month="2023-04-01")
+        _insert_hn_story_row(mem_conn, story_id=2, month="2023-04-01")
+
+        first: int = db_setup._load_hn_reference_docs(mem_conn, "seed")
+        second: int = db_setup._load_hn_reference_docs(mem_conn, "seed")
+
+        assert first == second == 2
+
+    def test_prunes_orphan_social_rows(
+        self, mem_conn: sqlite3.Connection
+    ) -> None:
+        """Pre-existing social rows not in the new top-5 are removed."""
+        # Pre-seed an orphan: a social row whose story_id is NOT in hn_stories.
+        mem_conn.execute(
+            """
+            INSERT INTO reference_docs (
+                series_id, doc_type, title, content, source_url, fetched_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "USINFO",
+                "social:hn:9999999",
+                "Stale title",
+                "Stale content",
+                "https://news.ycombinator.com/item?id=9999999",
+                "2020-01-01T00:00:00+00:00",
+            ),
+        )
+        mem_conn.commit()
+
+        _insert_hn_story_row(mem_conn, story_id=1, month="2023-05-01")
+        db_setup._load_hn_reference_docs(mem_conn, "seed")
+
+        remaining: list[tuple[str]] = mem_conn.execute(
+            "SELECT doc_type FROM reference_docs "
+            "WHERE doc_type LIKE 'social:hn:%' ORDER BY doc_type"
+        ).fetchall()
+        doc_types: list[str] = [row[0] for row in remaining]
+        assert "social:hn:9999999" not in doc_types
+        assert doc_types == ["social:hn:1"]
+
+    def test_skips_when_hn_stories_empty(
+        self, mem_conn: sqlite3.Connection
+    ) -> None:
+        """Empty ``hn_stories`` returns 0 and writes no rows."""
+        count: int = db_setup._load_hn_reference_docs(mem_conn, "seed")
+        assert count == 0
+        remaining: int = mem_conn.execute(
+            "SELECT COUNT(*) FROM reference_docs "
+            "WHERE doc_type LIKE 'social:hn:%'"
+        ).fetchone()[0]
+        assert remaining == 0

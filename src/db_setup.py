@@ -640,6 +640,154 @@ def _build_hn_monthly_aggregate(conn: sqlite3.Connection) -> int:
     return int(inserted)
 
 
+_HN_REFERENCE_SERIES_ID: str = "USINFO"
+"""Fixed ``series_id`` for HN reference_docs rows.
+
+Info-sector employment is the topic the HN corpus informs most
+directly. Storing all HN refs under the same series_id lets the
+retrieval ``series_hint='USINFO'`` path surface them alongside FRED
+USINFO refs without extra filter logic.
+"""
+
+_HN_TOP_K_PER_MONTH: int = 5
+"""Number of HN stories per month to upsert into ``reference_docs``.
+
+Keeps the embedded HN corpus bounded (top-5 * 52 months ~= 260 chunks)
+so ``data/.chroma/`` growth stays under the 2.0 MB budget and
+similarity search signal-to-noise stays high.
+"""
+
+_HN_TITLE_MAX_CHARS: int = 240
+"""Defensive truncation for HN titles written into ``reference_docs.title``."""
+
+
+def _load_hn_reference_docs(conn: sqlite3.Connection, mode: str) -> int:
+    """Load top-K-per-month HN stories into ``reference_docs``.
+
+    Selects stories from ``hn_stories`` ranked by ``score`` descending
+    and ``story_id`` ascending within each month, keeps the top
+    ``_HN_TOP_K_PER_MONTH``, and upserts each into ``reference_docs``
+    under ``series_id = _HN_REFERENCE_SERIES_ID`` and
+    ``doc_type = f'social:hn:{story_id}'``. Prunes any pre-existing
+    ``social:hn:%`` rows whose story_id is no longer in the current
+    selection so re-runs do not leave orphans.
+
+    Args:
+        conn: Open SQLite connection with ``hn_stories`` populated.
+        mode: ``'seed'`` or ``'full'``. Reserved for future filtering;
+            both modes use the same selection today.
+
+    Returns:
+        Count of ``social:hn:%`` rows present in ``reference_docs``
+        after the upsert/prune cycle.
+    """
+    _ = mode  # reserved for future filtering
+
+    total_stories: int = conn.execute(
+        "SELECT COUNT(*) FROM hn_stories"
+    ).fetchone()[0]
+    if total_stories == 0:
+        logger.info("No HN stories - skipping social reference loading")
+        return 0
+
+    # Top-K per month using a windowed rank. story_id ASC tiebreak is
+    # deterministic so the committed seed.db matches across rebuilds.
+    top_k_sql: str = f"""
+        SELECT story_id, created_utc, title, text_excerpt, hn_permalink
+        FROM (
+            SELECT
+                story_id,
+                created_utc,
+                title,
+                text_excerpt,
+                hn_permalink,
+                ROW_NUMBER() OVER (
+                    PARTITION BY month
+                    ORDER BY score DESC, story_id ASC
+                ) AS rn
+            FROM hn_stories
+        )
+        WHERE rn <= {_HN_TOP_K_PER_MONTH}
+        ORDER BY created_utc ASC, story_id ASC
+    """
+    selected: list[tuple[int, str, str, str, str]] = conn.execute(
+        top_k_sql
+    ).fetchall()
+
+    if not selected:
+        logger.info("No HN stories selected - skipping social reference loading")
+        return 0
+
+    selected_doc_types: set[str] = set()
+    upserted: int = 0
+
+    for story_id, created_utc, title, text_excerpt, hn_permalink in selected:
+        doc_type: str = f"social:hn:{story_id}"
+        selected_doc_types.add(doc_type)
+
+        title_clean: str = (title or "").strip()[:_HN_TITLE_MAX_CHARS]
+        excerpt_clean: str = (text_excerpt or "").strip()
+        content: str = (
+            f"{title_clean}\n\n{excerpt_clean}" if excerpt_clean else title_clean
+        )
+
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO reference_docs (
+                series_id, doc_type, title, content, source_url, fetched_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                _HN_REFERENCE_SERIES_ID,
+                doc_type,
+                title_clean,
+                content,
+                hn_permalink,
+                created_utc,
+            ),
+        )
+        upserted += 1
+
+    # Two-step orphan prune: read existing social ids, compute set
+    # difference in Python, delete by id. Keeps the IN list bounded by
+    # the number of actual orphans (typically 0-10) rather than by
+    # the full selection size.
+    existing: list[tuple[int, str]] = conn.execute(
+        """
+        SELECT id, doc_type FROM reference_docs
+        WHERE series_id = ? AND doc_type LIKE 'social:hn:%'
+        """,
+        (_HN_REFERENCE_SERIES_ID,),
+    ).fetchall()
+    orphan_ids: list[int] = [
+        row_id for row_id, doc_type in existing
+        if doc_type not in selected_doc_types
+    ]
+    if orphan_ids:
+        placeholders: str = ",".join("?" * len(orphan_ids))
+        conn.execute(
+            f"DELETE FROM reference_docs WHERE id IN ({placeholders})",  # noqa: S608
+            orphan_ids,
+        )
+
+    conn.commit()
+
+    final_count: int = conn.execute(
+        """
+        SELECT COUNT(*) FROM reference_docs
+        WHERE series_id = ? AND doc_type LIKE 'social:hn:%'
+        """,
+        (_HN_REFERENCE_SERIES_ID,),
+    ).fetchone()[0]
+
+    logger.info(
+        "Loaded %d HN reference_docs rows (pruned %d orphans)",
+        upserted,
+        len(orphan_ids),
+    )
+    return int(final_count)
+
+
 def _print_summary(conn: sqlite3.Connection, stats: dict[str, dict[str, int]]) -> None:
     """Print a summary of what was loaded into the database.
 
@@ -667,11 +815,17 @@ def _print_summary(conn: sqlite3.Connection, stats: dict[str, dict[str, int]]) -
     scholarly_count: int = conn.execute(
         "SELECT COUNT(*) FROM reference_docs WHERE doc_type LIKE 'scholarly:%'"
     ).fetchone()[0]
+    social_count: int = conn.execute(
+        "SELECT COUNT(*) FROM reference_docs WHERE doc_type LIKE 'social:%'"
+    ).fetchone()[0]
     fred_count: int = conn.execute(
-        "SELECT COUNT(*) FROM reference_docs WHERE doc_type NOT LIKE 'scholarly:%'"
+        "SELECT COUNT(*) FROM reference_docs "
+        "WHERE doc_type NOT LIKE 'scholarly:%' "
+        "AND doc_type NOT LIKE 'social:%'"
     ).fetchone()[0]
     print(f"    reference_docs (FRED):   {fred_count:>6,}")
     print(f"    reference_docs (schol.): {scholarly_count:>6,}")
+    print(f"    reference_docs (social): {social_count:>6,}")
 
     # HN month coverage (compact, non-essential if table is empty)
     hn_range: tuple | None = conn.execute(
@@ -741,6 +895,7 @@ def build_database(mode: str = "seed") -> Path:
         _load_scholarly_docs(conn, mode)
         _load_hn_stories(conn, mode)
         _build_hn_monthly_aggregate(conn)
+        _load_hn_reference_docs(conn, mode)
         _print_summary(conn, stats)
     finally:
         conn.close()
