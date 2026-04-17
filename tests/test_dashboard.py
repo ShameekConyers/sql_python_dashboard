@@ -345,16 +345,19 @@ GLOSSARY_TERMS: list[tuple[str, str]] = [
     ("ARIMA / COVID Adjustment", "An ARIMA model trained"),
     ("Recession Risk Score", "The model's output"),
     ("FRED (Federal Reserve Economic Data)", "A database of 800,000+"),
+    ("NMF (Non-negative Matrix Factorization)", "A topic modeling technique"),
+    ("TF-IDF (Term Frequency-Inverse Document Frequency)", "A text weighting scheme"),
+    ("Topic Model", "An unsupervised NLP method"),
 ]
 
-EXPECTED_GLOSSARY_COUNT: int = 15
+EXPECTED_GLOSSARY_COUNT: int = 18
 
 
 class TestGlossary:
     """Tests for glossary term coverage."""
 
     def test_glossary_has_expected_count(self) -> None:
-        """Glossary contains exactly 15 terms."""
+        """Glossary contains exactly 18 terms."""
         assert len(GLOSSARY_TERMS) == EXPECTED_GLOSSARY_COUNT
 
     def test_all_terms_non_empty(self) -> None:

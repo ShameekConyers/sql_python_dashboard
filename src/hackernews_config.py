@@ -4,11 +4,14 @@ Pure stdlib module. No runtime dependencies — importing this file must
 not load ``httpx``, ``transformers``, or any other heavy third-party
 package. The ingestion script and test fixtures import from here.
 
-The coverage window is anchored to ChatGPT's public release
-(2022-11-30), rounded down to the month start so December 2022 buckets
-include launch-week coverage. Keyword queries are curated to
-over-retrieve within the AI-labor-impact theme; monthly top-N-by-points
-selection filters the corpus down to a seed-friendly size.
+The coverage window starts at 2022-01-01 to match the default x-axis
+start of the dashboard's time-series charts, so HN months line up with
+visible FRED data. That also captures ~10 months of pre-ChatGPT
+tech-labor signal (Twitter acquisition aftermath, Meta's Nov 2022
+layoff wave, big-tech hiring slowdown) alongside the post-2022-11
+AI-labor-impact era. Keyword queries are curated to over-retrieve
+within the AI-labor-impact theme; monthly top-N-by-points selection
+filters the corpus down to a seed-friendly size.
 """
 
 from __future__ import annotations
@@ -65,7 +68,7 @@ ALGOLIA_BASE_URL: str = "https://hn.algolia.com/api/v1/search_by_date"
 
 ``search_by_date`` (not ``search``) sorts by recency and supports
 ``numericFilters`` on ``created_at_i``, which we use for the
-post-2022-11 window.
+2022-01-01-onward window.
 """
 
 ALGOLIA_HITS_PER_PAGE: int = 1000

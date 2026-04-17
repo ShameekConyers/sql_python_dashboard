@@ -80,6 +80,7 @@ def _create_schema(conn: sqlite3.Connection) -> None:
         "01_schema.sql",
         "06_reference_schema.sql",
         "07_hackernews_schema.sql",
+        "08_topic_schema.sql",
     ):
         schema_path: Path = SQL_DIR / schema_filename
         schema_sql: str = schema_path.read_text()
@@ -807,6 +808,9 @@ def _print_summary(conn: sqlite3.Connection, stats: dict[str, dict[str, int]]) -
         "reference_docs",
         "hn_stories",
         "hn_sentiment_monthly",
+        "hn_topics",
+        "hn_topic_assignments",
+        "hn_ngram_monthly",
     ):
         row: tuple = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()  # noqa: S608
         print(f"  {table:25s}  {row[0]:>8,} rows")

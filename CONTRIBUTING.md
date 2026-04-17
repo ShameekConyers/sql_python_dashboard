@@ -41,6 +41,7 @@ python src/hackernews_pull.py
 python src/sentiment_score.py
 python src/db_setup.py --full
 python src/covid_adjustment.py --full
+python src/topic_model.py --db full
 python src/export_csv.py --full
 python src/embed_references.py --db full --rebuild
 python src/recession_model.py --db full
