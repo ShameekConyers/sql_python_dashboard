@@ -1001,6 +1001,289 @@ def query_hn_sentiment_overlay(
     return merged[["month", "mean_sentiment_3m_avg", "info_pc_index"]]
 
 
+# ---------------------------------------------------------------------------
+# Phase 15: NLP Analysis query helpers
+# ---------------------------------------------------------------------------
+
+
+@st.cache_data(ttl=300)
+def query_topic_distribution(
+    date_min: str, date_max: str, full: bool = False
+) -> pd.DataFrame:
+    """Topic distribution over time for Chart 1 (stacked area).
+
+    Args:
+        date_min: Start date filter.
+        date_max: End date filter.
+        full: Whether to use ``full.db``.
+
+    Returns:
+        DataFrame with columns ``topic_id``, ``label``, ``month``,
+        ``story_count``.
+    """
+    from datetime import datetime, timezone  # noqa: PLC0415
+
+    effective_min: str = max(date_min[:7], "2022-01")
+    conn: sqlite3.Connection = get_connection(full)
+    try:
+        exists: int = conn.execute(
+            "SELECT COUNT(*) FROM sqlite_master "
+            "WHERE type='table' AND name='hn_topic_assignments'"
+        ).fetchone()[0]
+        if not exists:
+            return pd.DataFrame(
+                columns=["topic_id", "label", "month", "story_count"]
+            )
+        df: pd.DataFrame = pd.read_sql_query(
+            """
+            SELECT ta.topic_id, t.label,
+                   SUBSTR(s.month, 1, 7) AS month,
+                   COUNT(*) AS story_count
+            FROM hn_topic_assignments ta
+            JOIN hn_topics t ON ta.topic_id = t.topic_id
+            JOIN hn_stories s ON ta.story_id = s.story_id
+            GROUP BY ta.topic_id, SUBSTR(s.month, 1, 7)
+            ORDER BY SUBSTR(s.month, 1, 7), ta.topic_id
+            """,
+            conn,
+        )
+    finally:
+        conn.close()
+
+    if df.empty:
+        return df
+
+    today_ym: str = datetime.now(timezone.utc).strftime("%Y-%m")
+    df = df[df["month"] != today_ym]
+    df = df[
+        (df["month"] >= effective_min) & (df["month"] <= date_max[:7])
+    ]
+    return df
+
+
+@st.cache_data(ttl=300)
+def query_sentiment_by_topic(full: bool = False) -> pd.DataFrame:
+    """Sentiment distribution per topic for Chart 2 (box plot).
+
+    Args:
+        full: Whether to use ``full.db``.
+
+    Returns:
+        DataFrame with columns ``label``, ``sentiment_score``.
+    """
+    conn: sqlite3.Connection = get_connection(full)
+    try:
+        exists: int = conn.execute(
+            "SELECT COUNT(*) FROM sqlite_master "
+            "WHERE type='table' AND name='hn_topic_assignments'"
+        ).fetchone()[0]
+        if not exists:
+            return pd.DataFrame(columns=["label", "sentiment_score"])
+        df: pd.DataFrame = pd.read_sql_query(
+            """
+            SELECT t.label, s.sentiment_score
+            FROM hn_topic_assignments ta
+            JOIN hn_topics t ON ta.topic_id = t.topic_id
+            JOIN hn_stories s ON ta.story_id = s.story_id
+            """,
+            conn,
+        )
+    finally:
+        conn.close()
+    return df
+
+
+@st.cache_data(ttl=300)
+def query_layoff_vs_u6u3(
+    date_min: str, date_max: str, full: bool = False
+) -> pd.DataFrame:
+    """Layoff story volume vs U6-U3 gap for Chart 3 (dual-axis).
+
+    Args:
+        date_min: Start date filter.
+        date_max: End date filter.
+        full: Whether to use ``full.db``.
+
+    Returns:
+        DataFrame with columns ``month``, ``layoff_story_count``,
+        ``u6_u3_gap``.
+    """
+    from datetime import datetime, timezone  # noqa: PLC0415
+
+    effective_min: str = max(date_min[:7], "2022-01")
+    conn: sqlite3.Connection = get_connection(full)
+    try:
+        hn: pd.DataFrame = pd.read_sql_query(
+            "SELECT SUBSTR(month, 1, 7) AS month, layoff_story_count "
+            "FROM hn_sentiment_monthly ORDER BY month",
+            conn,
+        )
+        gap: pd.DataFrame = pd.read_sql_query(
+            """
+            SELECT SUBSTR(u6.date, 1, 7) AS month,
+                   u6.value_covid_adjusted - u3.value_covid_adjusted AS u6_u3_gap
+            FROM observations u6
+            JOIN observations u3
+              ON u3.series_id = 'UNRATE'
+              AND SUBSTR(u3.date, 1, 7) = SUBSTR(u6.date, 1, 7)
+            WHERE u6.series_id = 'U6RATE'
+            ORDER BY month
+            """,
+            conn,
+        )
+    finally:
+        conn.close()
+
+    merged: pd.DataFrame = hn.merge(gap, on="month", how="inner")
+    if merged.empty:
+        return pd.DataFrame(
+            columns=["month", "layoff_story_count", "u6_u3_gap"]
+        )
+
+    today_ym: str = datetime.now(timezone.utc).strftime("%Y-%m")
+    merged = merged[merged["month"] != today_ym]
+    merged = merged[
+        (merged["month"] >= effective_min) & (merged["month"] <= date_max[:7])
+    ]
+    return merged
+
+
+@st.cache_data(ttl=300)
+def query_topic_sentiment_vs_usinfo(
+    date_min: str, date_max: str, full: bool = False
+) -> pd.DataFrame:
+    """Topic sentiment vs USINFO per-capita index for Chart 4 (dual-axis).
+
+    Returns the USINFO per-capita index (indexed to 100 at the earliest
+    HN month) and mean monthly sentiment for the top-2 most populated
+    topics.
+
+    Args:
+        date_min: Start date filter.
+        date_max: End date filter.
+        full: Whether to use ``full.db``.
+
+    Returns:
+        DataFrame with columns ``month``, ``info_pc_index``, and one
+        column per top-2 topic label containing monthly mean sentiment.
+    """
+    from datetime import datetime, timezone  # noqa: PLC0415
+
+    effective_min: str = max(date_min[:7], "2022-01")
+    conn: sqlite3.Connection = get_connection(full)
+    try:
+        # Top-2 topics by story_count
+        top2: list[tuple[int, str]] = conn.execute(
+            "SELECT topic_id, label FROM hn_topics "
+            "ORDER BY story_count DESC LIMIT 2"
+        ).fetchall()
+        if not top2:
+            return pd.DataFrame(columns=["month", "info_pc_index"])
+
+        top2_ids: list[int] = [t[0] for t in top2]
+        top2_labels: list[str] = [t[1] for t in top2]
+        placeholders: str = ",".join("?" * len(top2_ids))
+
+        # Monthly sentiment per top-2 topic
+        topic_sent: pd.DataFrame = pd.read_sql_query(
+            f"""
+            SELECT t.label, SUBSTR(s.month, 1, 7) AS month,
+                   AVG(s.sentiment_score) AS avg_sent
+            FROM hn_topic_assignments ta
+            JOIN hn_topics t ON ta.topic_id = t.topic_id
+            JOIN hn_stories s ON ta.story_id = s.story_id
+            WHERE ta.topic_id IN ({placeholders})
+            GROUP BY t.label, SUBSTR(s.month, 1, 7)
+            ORDER BY month
+            """,
+            conn,
+            params=top2_ids,
+        )
+
+        # USINFO per-capita index
+        info: pd.DataFrame = pd.read_sql_query(
+            """
+            SELECT
+                SUBSTR(o.date, 1, 7) AS month,
+                o.value_covid_adjusted / p.value_covid_adjusted * 1000 AS info_pc
+            FROM observations o
+            JOIN observations p
+              ON p.series_id = 'CNP16OV'
+              AND SUBSTR(p.date, 1, 7) = SUBSTR(o.date, 1, 7)
+            WHERE o.series_id = 'USINFO'
+            ORDER BY month
+            """,
+            conn,
+        )
+    finally:
+        conn.close()
+
+    if topic_sent.empty or info.empty:
+        return pd.DataFrame(columns=["month", "info_pc_index"])
+
+    # Pivot topic sentiment: one column per topic label
+    pivot: pd.DataFrame = topic_sent.pivot_table(
+        index="month", columns="label", values="avg_sent"
+    ).reset_index()
+
+    # Index info_pc to 100 at earliest HN month
+    hn_start: str = pivot["month"].iloc[0]
+    base_row = info.loc[info["month"] >= hn_start, "info_pc"]
+    base: float = float(base_row.iloc[0]) if not base_row.empty else 1.0
+    info["info_pc_index"] = info["info_pc"] / base * 100
+
+    merged: pd.DataFrame = info[["month", "info_pc_index"]].merge(
+        pivot, on="month", how="inner"
+    )
+
+    today_ym: str = datetime.now(timezone.utc).strftime("%Y-%m")
+    merged = merged[merged["month"] != today_ym]
+    merged = merged[
+        (merged["month"] >= effective_min) & (merged["month"] <= date_max[:7])
+    ]
+    return merged
+
+
+@st.cache_data(ttl=300)
+def query_ngram_trends(
+    date_min: str, date_max: str, full: bool = False
+) -> pd.DataFrame:
+    """Monthly bigram frequencies for the n-gram trending section.
+
+    Args:
+        date_min: Start date filter.
+        date_max: End date filter.
+        full: Whether to use ``full.db``.
+
+    Returns:
+        DataFrame with columns ``month``, ``ngram``, ``count``.
+    """
+    effective_min: str = max(date_min[:7], "2022-01")
+    conn: sqlite3.Connection = get_connection(full)
+    try:
+        exists: int = conn.execute(
+            "SELECT COUNT(*) FROM sqlite_master "
+            "WHERE type='table' AND name='hn_ngram_monthly'"
+        ).fetchone()[0]
+        if not exists:
+            return pd.DataFrame(columns=["month", "ngram", "count"])
+        df: pd.DataFrame = pd.read_sql_query(
+            "SELECT SUBSTR(month, 1, 7) AS month, ngram, count "
+            "FROM hn_ngram_monthly ORDER BY month, count DESC",
+            conn,
+        )
+    finally:
+        conn.close()
+
+    if df.empty:
+        return df
+
+    df = df[
+        (df["month"] >= effective_min) & (df["month"] <= date_max[:7])
+    ]
+    return df
+
+
 @st.cache_data(ttl=300)
 def query_q8(date_min: str, date_max: str, full: bool = False) -> pd.DataFrame:
     """Q8: CPI inflation MoM and YoY.
@@ -1380,6 +1663,24 @@ GLOSSARY_TERMS: list[tuple[str, str]] = [
         "A database of 800,000+ economic time series maintained by the "
         "Federal Reserve Bank of St. Louis. The data source for this "
         "dashboard.",
+    ),
+    (
+        "NMF (Non-negative Matrix Factorization)",
+        "A topic modeling technique that decomposes a document-term matrix "
+        "into non-negative factors, producing interpretable topic clusters. "
+        "Used here to group HN stories by theme.",
+    ),
+    (
+        "TF-IDF (Term Frequency-Inverse Document Frequency)",
+        "A text weighting scheme that scores words higher when they appear "
+        "frequently in a document but rarely across the corpus. Reduces "
+        "the influence of common words like 'the' and 'is'.",
+    ),
+    (
+        "Topic Model",
+        "An unsupervised NLP method that discovers latent themes in a "
+        "collection of documents. Each topic is characterized by its "
+        "highest-weighted terms.",
     ),
 ]
 
@@ -2109,7 +2410,207 @@ st.divider()
 
 
 # ---------------------------------------------------------------------------
-# Section C: Deep Dive — the core question
+# Section C: NLP Analysis — topic modeling and cross-domain charts
+# ---------------------------------------------------------------------------
+
+st.header("NLP Analysis")
+
+st.markdown(
+    "Topic modeling (NMF) over 1,500+ Hacker News stories reveals *what* "
+    "the tech-labor conversation is about, not just how negative it is. "
+    "The charts below break down topic trends, sentiment by topic, and "
+    "cross-domain connections to macro indicators."
+)
+
+render_ai_insight_block("hn_topic_analysis", "trend", use_full)
+
+# Chart 1: Topic Distribution Over Time (stacked area)
+nlp_topic_dist: pd.DataFrame = query_topic_distribution(date_min, date_max, use_full)
+if not nlp_topic_dist.empty:
+    fig_topic_dist = go.Figure()
+    for label in nlp_topic_dist["label"].unique():
+        subset = nlp_topic_dist[nlp_topic_dist["label"] == label]
+        fig_topic_dist.add_trace(go.Scatter(
+            x=subset["month"],
+            y=subset["story_count"],
+            mode="lines",
+            name=label,
+            stackgroup="one",
+        ))
+    fig_topic_dist.update_layout(
+        title="Topic Distribution Over Time",
+        xaxis_title="Month",
+        yaxis_title="Stories",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        height=450,
+    )
+    add_annotated_vline(fig_topic_dist, CHATGPT_LAUNCH, text="ChatGPT Launch")
+    st.plotly_chart(fig_topic_dist, use_container_width=True, key="nlp_topic_dist")
+else:
+    st.info("No topic distribution data available for the selected range.")
+
+# Chart 2: Sentiment by Topic (horizontal box plot)
+nlp_sent_by_topic: pd.DataFrame = query_sentiment_by_topic(use_full)
+if not nlp_sent_by_topic.empty:
+    fig_sent_topic = go.Figure()
+    for label in nlp_sent_by_topic["label"].unique():
+        subset = nlp_sent_by_topic[nlp_sent_by_topic["label"] == label]
+        median_val: float = float(subset["sentiment_score"].median())
+        if median_val < -0.1:
+            box_color = "#EF553B"
+        elif median_val > 0.1:
+            box_color = "#00CC96"
+        else:
+            box_color = "#636EFA"
+        fig_sent_topic.add_trace(go.Box(
+            x=subset["sentiment_score"],
+            name=label,
+            orientation="h",
+            marker_color=box_color,
+        ))
+    fig_sent_topic.update_layout(
+        title="Sentiment Distribution by Topic",
+        xaxis_title="Sentiment Score",
+        height=400,
+        showlegend=False,
+    )
+    fig_sent_topic.update_traces(hoverinfo="x", hovertemplate="%{x:.3f}<extra></extra>")
+    st.plotly_chart(fig_sent_topic, use_container_width=True, key="nlp_sent_topic")
+else:
+    st.info("No topic sentiment data available.")
+
+render_ai_insight_block("nlp_topic_sentiment", "trend", use_full)
+
+# Charts 3 & 4 side by side
+nlp_col1, nlp_col2 = st.columns(2)
+
+# Chart 3: Layoff Volume vs U6-U3 Gap (dual-axis)
+nlp_layoff_gap: pd.DataFrame = query_layoff_vs_u6u3(date_min, date_max, use_full)
+with nlp_col1:
+    if not nlp_layoff_gap.empty:
+        fig_layoff = make_subplots(specs=[[{"secondary_y": True}]])
+        fig_layoff.add_trace(
+            go.Bar(
+                x=nlp_layoff_gap["month"],
+                y=nlp_layoff_gap["layoff_story_count"],
+                name="Layoff Stories",
+                marker_color="#EF553B",
+                opacity=0.7,
+            ),
+            secondary_y=False,
+        )
+        fig_layoff.add_trace(
+            go.Scatter(
+                x=nlp_layoff_gap["month"],
+                y=nlp_layoff_gap["u6_u3_gap"],
+                name="U6-U3 Gap (pp)",
+                line=dict(color="#00CC96", width=2),
+            ),
+            secondary_y=True,
+        )
+        fig_layoff.update_layout(
+            title="Layoff Story Volume vs U6-U3 Gap",
+            height=400,
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        )
+        fig_layoff.update_yaxes(title_text="Layoff Stories", secondary_y=False)
+        fig_layoff.update_yaxes(title_text="U6-U3 Gap (pp)", secondary_y=True)
+        add_annotated_vline(fig_layoff, CHATGPT_LAUNCH, text="ChatGPT")
+        st.plotly_chart(fig_layoff, use_container_width=True, key="nlp_layoff_gap")
+    else:
+        st.info("No layoff vs U6-U3 data available.")
+
+# Chart 4: Topic Sentiment vs USINFO Per-Capita
+nlp_topic_usinfo: pd.DataFrame = query_topic_sentiment_vs_usinfo(
+    date_min, date_max, use_full
+)
+with nlp_col2:
+    if not nlp_topic_usinfo.empty and "info_pc_index" in nlp_topic_usinfo.columns:
+        fig_topic_usinfo = make_subplots(specs=[[{"secondary_y": True}]])
+        fig_topic_usinfo.add_trace(
+            go.Scatter(
+                x=nlp_topic_usinfo["month"],
+                y=nlp_topic_usinfo["info_pc_index"],
+                name="USINFO Per-Capita Index",
+                line=dict(color="#636EFA", width=2),
+            ),
+            secondary_y=False,
+        )
+        # Add top-2 topic sentiment lines on secondary axis
+        topic_cols: list[str] = [
+            c for c in nlp_topic_usinfo.columns
+            if c not in ("month", "info_pc_index")
+        ]
+        colors: list[str] = ["#EF553B", "#FFA15A"]
+        for i, col in enumerate(topic_cols[:2]):
+            fig_topic_usinfo.add_trace(
+                go.Scatter(
+                    x=nlp_topic_usinfo["month"],
+                    y=nlp_topic_usinfo[col],
+                    name=col,
+                    line=dict(color=colors[i % len(colors)], width=2, dash="dot"),
+                ),
+                secondary_y=True,
+            )
+        fig_topic_usinfo.update_layout(
+            title="Topic Sentiment vs USINFO Per-Capita",
+            height=400,
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        )
+        fig_topic_usinfo.update_yaxes(title_text="USINFO Index (100=base)", secondary_y=False)
+        fig_topic_usinfo.update_yaxes(title_text="Mean Sentiment", secondary_y=True)
+        add_annotated_vline(fig_topic_usinfo, CHATGPT_LAUNCH, text="ChatGPT")
+        st.plotly_chart(fig_topic_usinfo, use_container_width=True, key="nlp_topic_usinfo")
+    else:
+        st.info("No topic sentiment vs USINFO data available.")
+
+# N-gram trending section
+nlp_ngrams: pd.DataFrame = query_ngram_trends(date_min, date_max, use_full)
+if not nlp_ngrams.empty:
+    with st.expander("Trending Bigrams", expanded=False):
+        # Pivot to quarterly aggregation for readability
+        nlp_ngrams["quarter"] = nlp_ngrams["month"].str[:4] + "-Q" + (
+            (pd.to_numeric(nlp_ngrams["month"].str[5:7]) - 1) // 3 + 1
+        ).astype(str)
+        quarterly: pd.DataFrame = (
+            nlp_ngrams.groupby(["quarter", "ngram"])["count"]
+            .sum()
+            .reset_index()
+        )
+        # Top 8 ngrams overall for the heatmap
+        top_ngrams: list[str] = (
+            quarterly.groupby("ngram")["count"]
+            .sum()
+            .nlargest(8)
+            .index.tolist()
+        )
+        heatmap_data: pd.DataFrame = quarterly[
+            quarterly["ngram"].isin(top_ngrams)
+        ].pivot_table(index="ngram", columns="quarter", values="count", fill_value=0)
+
+        if not heatmap_data.empty:
+            fig_ngram = go.Figure(data=go.Heatmap(
+                z=heatmap_data.values,
+                x=heatmap_data.columns.tolist(),
+                y=heatmap_data.index.tolist(),
+                colorscale="YlOrRd",
+                hoverongaps=False,
+            ))
+            fig_ngram.update_layout(
+                title="Top Bigrams by Quarter",
+                xaxis_title="Quarter",
+                yaxis_title="Bigram",
+                height=350,
+            )
+            st.plotly_chart(fig_ngram, use_container_width=True, key="nlp_ngram_heatmap")
+
+render_ai_insight_block("nlp_cross_domain", "correlation", use_full)
+
+st.divider()
+
+
+# ---------------------------------------------------------------------------
+# Section D: Deep Dive — the core question
 # ---------------------------------------------------------------------------
 
 st.header("Deep Dive: AI's Reshaping of Work")

@@ -1934,6 +1934,30 @@ def _context_dashboard_intro(conn: sqlite3.Connection) -> dict[str, Any]:
         "SELECT COUNT(DISTINCT SUBSTR(date, 1, 7)) FROM observations"
     ).fetchone()[0]
 
+    # NLP topic summary for paragraph 2
+    topic_rows: list[tuple[str, int]] = conn.execute(
+        "SELECT label, story_count FROM hn_topics ORDER BY story_count DESC"
+    ).fetchall()
+    topic_count: int = len(topic_rows)
+    total_stories: int = sum(r[1] for r in topic_rows)
+    dominant_topic: str = topic_rows[0][0] if topic_rows else "N/A"
+    dominant_count: int = topic_rows[0][1] if topic_rows else 0
+
+    # Most-negative topic by mean sentiment
+    neg_row: tuple[str, float] | None = conn.execute(
+        """
+        SELECT t.label, AVG(s.sentiment_score) AS avg_sent
+        FROM hn_topic_assignments ta
+        JOIN hn_topics t ON ta.topic_id = t.topic_id
+        JOIN hn_stories s ON ta.story_id = s.story_id
+        GROUP BY t.topic_id
+        ORDER BY avg_sent ASC
+        LIMIT 1
+        """
+    ).fetchone()
+    most_neg_topic: str = neg_row[0] if neg_row else "N/A"
+    most_neg_sent: float = neg_row[1] if neg_row else 0.0
+
     context_text: str = (
         f"Dashboard Macro Landscape Summary:\n"
         f"- Latest UNRATE: {unrate_val:.1f}% ({latest_unrate}) "
@@ -1945,7 +1969,15 @@ def _context_dashboard_intro(conn: sqlite3.Connection) -> dict[str, Any]:
         f"[rate-type series; describe changes in percentage points]\n"
         f"- CPI YoY inflation: {cpi_yoy:.2f}% "
         f"[rate-type series; describe changes in percentage points]\n"
-        f"- Dataset spans {total_months} months of observations"
+        f"- Dataset spans {total_months} months of observations\n\n"
+        f"NLP Topic Analysis (Hacker News tech-practitioner corpus):\n"
+        f"- {topic_count} topics modeled across {total_stories} stories "
+        f"(NMF topic model on HN titles + excerpts, 2022-present)\n"
+        f"- Dominant topic: \"{dominant_topic}\" ({dominant_count} stories)\n"
+        f"- Most-negative topic: \"{most_neg_topic}\" "
+        f"(mean sentiment {most_neg_sent:+.3f})\n"
+        f"- Sentiment is a [-1, 1] compound score from a transformer model "
+        f"on a self-selected tech-practitioner audience"
     )
 
     return {
@@ -1956,6 +1988,9 @@ def _context_dashboard_intro(conn: sqlite3.Connection) -> dict[str, Any]:
             "t10y2y": round(t10y2y_val, 2),
             "cpi_yoy": round(cpi_yoy, 2),
             "total_months": total_months,
+            "topic_count": topic_count,
+            "dominant_topic": dominant_topic,
+            "dominant_topic_count": dominant_count,
         },
     }
 
@@ -2709,6 +2744,498 @@ def _context_synthesis(conn: sqlite3.Connection) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# HN topic analysis slice (Phase 15)
+# ---------------------------------------------------------------------------
+
+
+def _context_hn_topic_analysis(conn: sqlite3.Connection) -> dict[str, Any]:
+    """Build the LLM context block for the HN topic analysis slice.
+
+    Queries ``hn_topics`` for topic labels and story counts, plus
+    ``hn_topic_assignments`` joined with ``hn_stories`` for per-topic
+    monthly sentiment averages. Builds a DATA CONTEXT block with topic
+    list, sentiment trends, and layoff volume trends.
+
+    Args:
+        conn: SQLite database connection.
+
+    Returns:
+        Dict with ``context_text`` and ``data_points``.
+    """
+    topics: list[tuple[int, str, int]] = conn.execute(
+        "SELECT topic_id, label, story_count FROM hn_topics ORDER BY story_count DESC"
+    ).fetchall()
+
+    if not topics:
+        return {
+            "context_text": (
+                "HN Topic Analysis: no topic data available. "
+                "Skipping this slice."
+            ),
+            "data_points": {},
+        }
+
+    # Per-topic mean sentiment
+    topic_sentiments: list[tuple[int, str, float]] = conn.execute(
+        """
+        SELECT t.topic_id, t.label, AVG(s.sentiment_score) AS mean_sent
+        FROM hn_topic_assignments ta
+        JOIN hn_topics t ON ta.topic_id = t.topic_id
+        JOIN hn_stories s ON ta.story_id = s.story_id
+        GROUP BY t.topic_id
+        ORDER BY mean_sent ASC
+        """
+    ).fetchall()
+
+    # Top-3 topics by story count for month-over-month trend
+    top3_ids: list[int] = [t[0] for t in topics[:3]]
+    placeholders: str = ",".join("?" * len(top3_ids))
+    monthly_sent: list[tuple[int, str, str, float]] = conn.execute(
+        f"""
+        SELECT ta.topic_id, t.label, s.month, AVG(s.sentiment_score) AS avg_sent
+        FROM hn_topic_assignments ta
+        JOIN hn_topics t ON ta.topic_id = t.topic_id
+        JOIN hn_stories s ON ta.story_id = s.story_id
+        WHERE ta.topic_id IN ({placeholders})
+        GROUP BY ta.topic_id, s.month
+        ORDER BY s.month DESC
+        LIMIT 18
+        """,  # noqa: S608
+        top3_ids,
+    ).fetchall()
+
+    # Layoff volume trend: last 6 months vs prior 6 months
+    latest_month: str | None = _hn_latest_complete_month(conn)
+    layoff_trend: str = "stable"
+    recent_avg: float = 0.0
+    prior_avg: float = 0.0
+    if latest_month is not None:
+        recent_start: str = _month_offset(latest_month, -5)
+        prior_end: str = _month_offset(recent_start, -1)
+        prior_start: str = _month_offset(prior_end, -5)
+
+        recent_row = conn.execute(
+            """
+            SELECT AVG(layoff_story_count) FROM hn_sentiment_monthly
+            WHERE month BETWEEN ? AND ?
+            """,
+            (recent_start, latest_month),
+        ).fetchone()
+        prior_row = conn.execute(
+            """
+            SELECT AVG(layoff_story_count) FROM hn_sentiment_monthly
+            WHERE month BETWEEN ? AND ?
+            """,
+            (prior_start, prior_end),
+        ).fetchone()
+
+        recent_avg = float(recent_row[0]) if recent_row and recent_row[0] else 0.0
+        prior_avg = float(prior_row[0]) if prior_row and prior_row[0] else 0.0
+
+        if recent_avg > prior_avg * 1.1:
+            layoff_trend = "increasing"
+        elif recent_avg < prior_avg * 0.9:
+            layoff_trend = "decreasing"
+
+    # Build context text
+    topic_lines: list[str] = []
+    for tid, label, count in topics:
+        mean_sent: float = 0.0
+        for ts_tid, _, ts_sent in topic_sentiments:
+            if ts_tid == tid:
+                mean_sent = ts_sent
+                break
+        topic_lines.append(
+            f"  - {label}: {count} stories, mean sentiment {mean_sent:+.3f}"
+        )
+
+    monthly_lines: list[str] = []
+    for tid, label, month, avg_sent in monthly_sent[:12]:
+        monthly_lines.append(f"  - {label} ({month}): {avg_sent:+.3f}")
+
+    context_text: str = (
+        f"HN Topic Analysis ({len(topics)} topics, "
+        f"{sum(t[2] for t in topics)} total stories):\n"
+        + "\n".join(topic_lines)
+        + "\n\nMonthly sentiment for top-3 topics (recent months):\n"
+        + "\n".join(monthly_lines)
+        + f"\n\nLayoff story volume trend: {layoff_trend} "
+        f"(recent 6m avg: {recent_avg:.1f}, prior 6m avg: {prior_avg:.1f})"
+    )
+
+    dominant: tuple[int, str, int] = topics[0]
+    most_neg: tuple[int, str, float] = topic_sentiments[0]
+
+    return {
+        "context_text": context_text,
+        "data_points": {
+            "topic_count": len(topics),
+            "dominant_topic": dominant[1],
+            "dominant_topic_count": dominant[2],
+            "most_negative_topic": most_neg[1],
+            "most_negative_sentiment": round(most_neg[2], 3),
+            "layoff_volume_trend": layoff_trend,
+            "recent_layoff_avg": round(recent_avg, 1),
+            "prior_layoff_avg": round(prior_avg, 1),
+        },
+    }
+
+
+def _claims_hn_topic_analysis(
+    conn: sqlite3.Connection,
+) -> list[dict[str, Any]]:
+    """Build verifiable claims for the HN topic analysis slice.
+
+    Claims anchor on FRED series (USINFO change) so the existing
+    verifier infrastructure validates them without new verifier types.
+
+    Args:
+        conn: SQLite database connection.
+
+    Returns:
+        List of structured claim dicts.
+    """
+    ctx: dict[str, Any] = _context_hn_topic_analysis(conn)
+    data: dict[str, Any] = ctx["data_points"]
+    if not data:
+        return []
+
+    latest_month: str | None = _hn_latest_complete_month(conn)
+    if latest_month is None:
+        return []
+
+    window_start: str = _month_offset(latest_month, -11)
+
+    usinfo_change: float = _compute_change(
+        conn, "USINFO", window_start, latest_month,
+    )
+
+    usinfo_anchor: str = _latest_month(conn, "USINFO")
+    usinfo_latest_val: float | None = _boundary_value(
+        conn, "USINFO", usinfo_anchor, usinfo_anchor, position="end",
+    )
+    usinfo_latest: float = (
+        round(usinfo_latest_val, 2) if usinfo_latest_val is not None else 0.0
+    )
+
+    return [
+        _make_claim(
+            (
+                f"USINFO changed {usinfo_change:+.2f}% between "
+                f"{window_start} and {latest_month}"
+            ),
+            "USINFO",
+            usinfo_change,
+            "value",
+            "change_pct",
+            window_start,
+            latest_month,
+        ),
+        _make_claim(
+            f"USINFO latest reading: {usinfo_latest:.2f}",
+            "USINFO",
+            usinfo_latest,
+            "value",
+            "latest",
+            usinfo_anchor,
+            usinfo_anchor,
+        ),
+    ]
+
+
+def _context_nlp_topic_sentiment(conn: sqlite3.Connection) -> dict[str, Any]:
+    """Build LLM context for the NLP topic + sentiment insight (charts 1-2).
+
+    Covers topic distribution trends and per-topic sentiment spreads.
+
+    Args:
+        conn: SQLite database connection.
+
+    Returns:
+        Dict with ``context_text`` and ``data_points``.
+    """
+    topics: list[tuple[int, str, int]] = conn.execute(
+        "SELECT topic_id, label, story_count FROM hn_topics ORDER BY story_count DESC"
+    ).fetchall()
+
+    if not topics:
+        return {"context_text": "No topic data available.", "data_points": {}}
+
+    topic_sentiments: list[tuple[str, float, float, float]] = conn.execute(
+        """
+        SELECT t.label,
+               AVG(s.sentiment_score) AS mean_sent,
+               MIN(s.sentiment_score) AS min_sent,
+               MAX(s.sentiment_score) AS max_sent
+        FROM hn_topic_assignments ta
+        JOIN hn_topics t ON ta.topic_id = t.topic_id
+        JOIN hn_stories s ON ta.story_id = s.story_id
+        GROUP BY t.topic_id
+        ORDER BY mean_sent ASC
+        """
+    ).fetchall()
+
+    # Monthly topic counts for trend (last 6 months)
+    latest_month: str | None = _hn_latest_complete_month(conn)
+    monthly_lines: list[str] = []
+    if latest_month:
+        six_mo_ago: str = _month_offset(latest_month, -5)
+        monthly_dist: list[tuple[str, str, int]] = conn.execute(
+            """
+            SELECT t.label, s.month, COUNT(*) AS cnt
+            FROM hn_topic_assignments ta
+            JOIN hn_topics t ON ta.topic_id = t.topic_id
+            JOIN hn_stories s ON ta.story_id = s.story_id
+            WHERE s.month BETWEEN ? AND ?
+            GROUP BY t.label, s.month
+            ORDER BY s.month DESC, cnt DESC
+            """,
+            (six_mo_ago, latest_month),
+        ).fetchall()
+        for label, month, cnt in monthly_dist[:18]:
+            monthly_lines.append(f"  - {label} ({month[:7]}): {cnt} stories")
+
+    topic_lines: list[str] = []
+    for label, mean_s, min_s, max_s in topic_sentiments:
+        topic_lines.append(
+            f"  - {label}: mean {mean_s:+.3f}, range [{min_s:+.3f}, {max_s:+.3f}]"
+        )
+
+    total_stories: int = sum(t[2] for t in topics)
+    context_text: str = (
+        f"NLP Topic & Sentiment Summary ({len(topics)} topics, "
+        f"{total_stories} stories):\n\n"
+        "Per-topic sentiment distribution:\n"
+        + "\n".join(topic_lines)
+        + "\n\nRecent monthly topic counts:\n"
+        + "\n".join(monthly_lines)
+    )
+
+    dominant: tuple[int, str, int] = topics[0]
+    most_neg_label: str = topic_sentiments[0][0]
+    most_neg_sent: float = topic_sentiments[0][1]
+
+    return {
+        "context_text": context_text,
+        "data_points": {
+            "topic_count": len(topics),
+            "total_stories": total_stories,
+            "dominant_topic": dominant[1],
+            "dominant_topic_count": dominant[2],
+            "most_negative_topic": most_neg_label,
+            "most_negative_sentiment": round(most_neg_sent, 3),
+        },
+    }
+
+
+def _claims_nlp_topic_sentiment(
+    conn: sqlite3.Connection,
+) -> list[dict[str, Any]]:
+    """Build verifiable claims for the NLP topic + sentiment insight.
+
+    Anchors on USINFO change so the existing verifier validates them.
+
+    Args:
+        conn: SQLite database connection.
+
+    Returns:
+        List of structured claim dicts.
+    """
+    latest_month: str | None = _hn_latest_complete_month(conn)
+    if latest_month is None:
+        return []
+
+    usinfo_anchor: str = _latest_month(conn, "USINFO")
+    window_start: str = _month_offset(usinfo_anchor, -11)
+    usinfo_change: float = _compute_change(
+        conn, "USINFO", window_start, usinfo_anchor,
+    )
+
+    return [
+        _make_claim(
+            (
+                f"USINFO changed {usinfo_change:+.2f}% between "
+                f"{window_start} and {usinfo_anchor}"
+            ),
+            "USINFO",
+            usinfo_change,
+            "value",
+            "change_pct",
+            window_start,
+            usinfo_anchor,
+        ),
+    ]
+
+
+def _context_nlp_cross_domain(conn: sqlite3.Connection) -> dict[str, Any]:
+    """Build LLM context for the NLP cross-domain insight (charts 3-4).
+
+    Covers layoff volume vs U6-U3 gap and topic sentiment vs USINFO
+    per-capita trends.
+
+    Args:
+        conn: SQLite database connection.
+
+    Returns:
+        Dict with ``context_text`` and ``data_points``.
+    """
+    latest_month: str | None = _hn_latest_complete_month(conn)
+    if latest_month is None:
+        return {"context_text": "No HN data available.", "data_points": {}}
+
+    # Layoff volume vs U6-U3 gap
+    six_mo_ago: str = _month_offset(latest_month, -5)
+    layoff_rows: list[tuple[str, int]] = conn.execute(
+        """
+        SELECT month, layoff_story_count
+        FROM hn_sentiment_monthly
+        WHERE month BETWEEN ? AND ?
+        ORDER BY month
+        """,
+        (six_mo_ago, latest_month),
+    ).fetchall()
+
+    gap_rows: list[tuple[str, float]] = conn.execute(
+        """
+        SELECT SUBSTR(u6.date, 1, 7) AS month,
+               u6.value_covid_adjusted - u3.value_covid_adjusted AS gap
+        FROM observations u6
+        JOIN observations u3
+          ON u3.series_id = 'UNRATE'
+          AND SUBSTR(u3.date, 1, 7) = SUBSTR(u6.date, 1, 7)
+        WHERE u6.series_id = 'U6RATE'
+          AND SUBSTR(u6.date, 1, 7) BETWEEN ? AND ?
+        ORDER BY month
+        """,
+        (six_mo_ago[:7], latest_month[:7]),
+    ).fetchall()
+
+    # Top-2 topics sentiment trend
+    top2: list[tuple[int, str]] = conn.execute(
+        "SELECT topic_id, label FROM hn_topics ORDER BY story_count DESC LIMIT 2"
+    ).fetchall()
+    top2_lines: list[str] = []
+    if top2:
+        top2_ids: list[int] = [t[0] for t in top2]
+        placeholders: str = ",".join("?" * len(top2_ids))
+        topic_sent: list[tuple[str, str, float]] = conn.execute(
+            f"""
+            SELECT t.label, s.month, AVG(s.sentiment_score) AS avg_sent
+            FROM hn_topic_assignments ta
+            JOIN hn_topics t ON ta.topic_id = t.topic_id
+            JOIN hn_stories s ON ta.story_id = s.story_id
+            WHERE ta.topic_id IN ({placeholders})
+              AND s.month BETWEEN ? AND ?
+            GROUP BY t.label, s.month
+            ORDER BY s.month DESC
+            """,  # noqa: S608
+            [*top2_ids, six_mo_ago, latest_month],
+        ).fetchall()
+        for label, month, avg_s in topic_sent[:12]:
+            top2_lines.append(f"  - {label} ({month[:7]}): {avg_s:+.3f}")
+
+    # USINFO per-capita trend
+    usinfo_anchor: str = _latest_month(conn, "USINFO")
+    usinfo_yr_ago: str = _month_offset(usinfo_anchor, -11)
+    usinfo_change: float = _compute_change(
+        conn, "USINFO", usinfo_yr_ago, usinfo_anchor,
+    )
+
+    layoff_lines: list[str] = [
+        f"  - {m[:7]}: {c} layoff stories" for m, c in layoff_rows
+    ]
+    gap_lines: list[str] = [
+        f"  - {m}: U6-U3 gap {g:.1f} pp" for m, g in gap_rows
+    ]
+
+    context_text: str = (
+        "NLP Cross-Domain Analysis (HN signals vs macro indicators):\n\n"
+        "Layoff story volume (recent 6 months):\n"
+        + "\n".join(layoff_lines)
+        + "\n\nU6-U3 unemployment gap (recent 6 months):\n"
+        + "\n".join(gap_lines)
+        + "\n\nTop-2 topic sentiment trends:\n"
+        + "\n".join(top2_lines)
+        + f"\n\nUSINFO per-capita 12-month change: {usinfo_change:+.2f}%"
+    )
+
+    avg_layoff: float = (
+        sum(c for _, c in layoff_rows) / len(layoff_rows) if layoff_rows else 0
+    )
+    avg_gap: float = (
+        sum(g for _, g in gap_rows) / len(gap_rows) if gap_rows else 0
+    )
+
+    return {
+        "context_text": context_text,
+        "data_points": {
+            "avg_layoff_stories_6m": round(avg_layoff, 1),
+            "avg_u6_u3_gap_6m": round(avg_gap, 2),
+            "usinfo_12m_change": round(usinfo_change, 2),
+            "top2_topics": [t[1] for t in top2] if top2 else [],
+        },
+    }
+
+
+def _claims_nlp_cross_domain(
+    conn: sqlite3.Connection,
+) -> list[dict[str, Any]]:
+    """Build verifiable claims for the NLP cross-domain insight.
+
+    Anchors on USINFO and U6RATE changes so the existing verifier
+    validates them.
+
+    Args:
+        conn: SQLite database connection.
+
+    Returns:
+        List of structured claim dicts.
+    """
+    latest_month: str | None = _hn_latest_complete_month(conn)
+    if latest_month is None:
+        return []
+
+    usinfo_anchor: str = _latest_month(conn, "USINFO")
+    window_start: str = _month_offset(usinfo_anchor, -11)
+    usinfo_change: float = _compute_change(
+        conn, "USINFO", window_start, usinfo_anchor,
+    )
+
+    u6_anchor: str = _latest_month(conn, "U6RATE")
+    u6_val: float | None = _boundary_value(
+        conn, "U6RATE", u6_anchor, u6_anchor, position="end",
+    )
+    unrate_val: float | None = _boundary_value(
+        conn, "UNRATE", u6_anchor, u6_anchor, position="end",
+    )
+    gap: float = round((u6_val or 0) - (unrate_val or 0), 2)
+
+    return [
+        _make_claim(
+            (
+                f"USINFO changed {usinfo_change:+.2f}% between "
+                f"{window_start} and {usinfo_anchor}"
+            ),
+            "USINFO",
+            usinfo_change,
+            "value",
+            "change_pct",
+            window_start,
+            usinfo_anchor,
+        ),
+        _make_claim(
+            f"U6-U3 gap at {gap:.2f} pp ({u6_anchor})",
+            "U6RATE",
+            round(u6_val or 0, 1),
+            "value",
+            "latest",
+            u6_anchor,
+            u6_anchor,
+        ),
+    ]
+
+
+# ---------------------------------------------------------------------------
 # Insight slice configuration
 # ---------------------------------------------------------------------------
 
@@ -2718,24 +3245,38 @@ INSIGHT_SLICES: list[dict[str, Any]] = [
         "insight_type": "trend",
         "context_fn": _context_dashboard_intro,
         "claims_fn": _claims_dashboard_intro,
+        "paragraphs": 3,
         "analysis_prompt": (
-            "Ignore the 2-3 sentence instruction. Write two substantial "
-            "paragraphs (8-10 sentences total) suitable for the top of "
-            "an executive dashboard.\n\n"
-            "FIRST PARAGRAPH — Synthesis: Weave the headline numbers "
-            "into a narrative that tells a coherent story. Do not list "
-            "stats one after another. Connect them: what does "
-            "unemployment at this level, combined with this GDP growth "
-            "rate and this yield spread, actually mean for the economy "
-            "right now? Compare to historical norms where useful. A "
-            "C-suite reader should finish this paragraph understanding "
-            "the macro landscape without looking at a single chart.\n\n"
-            "SECOND PARAGRAPH — So What: Answer 'what should we watch "
+            "Ignore the 2-3 sentence instruction. Write three substantial "
+            "paragraphs (12-15 sentences total) suitable for the top of "
+            "an executive dashboard. Separate each paragraph with a "
+            "blank line.\n\n"
+            "FIRST PARAGRAPH — Macro Landscape: Weave the headline "
+            "numbers (unemployment, GDP, yield spread, CPI) into a "
+            "narrative that tells a coherent story. Do not list stats "
+            "one after another. Connect them: what does unemployment at "
+            "this level, combined with this GDP growth rate and this "
+            "yield spread, actually mean for the economy right now? "
+            "Compare to historical norms where useful. A C-suite reader "
+            "should finish this paragraph understanding the macro "
+            "landscape without looking at a single chart.\n\n"
+            "SECOND PARAGRAPH — NLP Signal: Describe what the Hacker "
+            "News topic analysis adds to the picture. The NMF topic "
+            "model surfaces what tech practitioners are discussing "
+            "(e.g., which topic dominates, which carries the most "
+            "negative sentiment). Tie the NLP signal back to the macro "
+            "data — does the dominant topic align with what the "
+            "employment or recession indicators show? Sentiment is a "
+            "compound score in [-1, 1]; report it as raw values, not "
+            "percentages. Frame HN as a self-selected tech-practitioner "
+            "audience, not a representative sample.\n\n"
+            "THIRD PARAGRAPH — So What: Answer 'what should we watch "
             "and why does it matter.' Identify the key tension or risk "
             "in the data, explain what would change your outlook (e.g., "
             "if the yield curve inverts, if unemployment crosses a "
-            "threshold), and give a forward-looking read. This paragraph "
-            "should feel like actionable intelligence, not a summary.\n\n"
+            "threshold, if HN sentiment shifts), and give a "
+            "forward-looking read. This paragraph should feel like "
+            "actionable intelligence, not a summary.\n\n"
             "Follow all system-prompt RULES — no causal verbs, no "
             "probability language, no invented numbers."
         ),
@@ -3003,6 +3544,76 @@ INSIGHT_SLICES: list[dict[str, Any]] = [
             "describe."
         ),
     },
+    {
+        "metric_key": "hn_topic_analysis",
+        "insight_type": "trend",
+        "context_fn": _context_hn_topic_analysis,
+        "claims_fn": _claims_hn_topic_analysis,
+        "paragraphs": 2,
+        "analysis_prompt": (
+            "Ignore the 2-3 sentence instruction. Write two substantial "
+            "paragraphs (8-10 sentences total) about the NMF topic "
+            "model findings over Hacker News tech-labor stories. "
+            "Separate each paragraph with a blank line.\n\n"
+            "FIRST PARAGRAPH — Description: Walk through what the "
+            "topic model found. Which topics dominate the conversation? "
+            "Which carry the most negative sentiment? How has the topic "
+            "mix shifted over time — did AI-related topics grow after "
+            "ChatGPT's launch while layoff topics evolved? Give "
+            "concrete numbers (topic counts, sentiment scores). Report "
+            "sentiment as raw compound scores (e.g. '-0.05'), not "
+            "percentages. Frame HN as a self-selected tech-practitioner "
+            "audience.\n\n"
+            "SECOND PARAGRAPH — So What: Relate the NLP signal to the "
+            "macro labor data. Does the dominant topic's sentiment "
+            "track alongside info-sector employment trends? What does "
+            "the most-negative topic tell us about where tech workers "
+            "feel the most pain? Use 'coincides with' or 'tracks "
+            "alongside'; the data does not establish causation. If "
+            "REFERENCE CONTEXT includes a Hacker News story, cite it "
+            "via [ref:N] when relevant.\n\n"
+            "Follow all system-prompt RULES — no causal verbs, no "
+            "probability language, no invented numbers."
+        ),
+    },
+    {
+        "metric_key": "nlp_topic_sentiment",
+        "insight_type": "trend",
+        "context_fn": _context_nlp_topic_sentiment,
+        "claims_fn": _claims_nlp_topic_sentiment,
+        "analysis_prompt": (
+            "Analyze the topic distribution and per-topic sentiment "
+            "patterns shown in the charts above. Which topics are "
+            "growing or shrinking over time? Which topics carry "
+            "notably wider or narrower sentiment spreads, and what "
+            "might that indicate about the diversity of opinions "
+            "within that theme? Report sentiment as raw compound "
+            "scores in [-1, 1], not percentages. Frame HN as a "
+            "self-selected tech-practitioner audience. Use 'coincides "
+            "with' or 'tracks alongside'; the data does not establish "
+            "causation."
+        ),
+    },
+    {
+        "metric_key": "nlp_cross_domain",
+        "insight_type": "correlation",
+        "context_fn": _context_nlp_cross_domain,
+        "claims_fn": _claims_nlp_cross_domain,
+        "analysis_prompt": (
+            "Analyze the cross-domain charts: layoff story volume vs "
+            "U6-U3 gap, and top-topic sentiment vs USINFO per-capita. "
+            "Does HN layoff chatter track alongside broadening labor "
+            "market slack (U6-U3 gap)? Does topic sentiment move in "
+            "the same direction as info-sector employment? Describe "
+            "any alignment or divergence you see in the data. Report "
+            "the U6-U3 gap in percentage points, USINFO changes as "
+            "percent changes, and sentiment as raw compound scores. "
+            "Use 'coincides with' or 'tracks alongside'; the data "
+            "does not establish causation. If REFERENCE CONTEXT "
+            "includes a Hacker News story, cite it via [ref:N] when "
+            "relevant."
+        ),
+    },
 ]
 
 
@@ -3082,6 +3693,45 @@ def _parse_narrative(raw_text: str) -> str:
         raise ValueError("LLM returned empty narrative")
 
     return text
+
+
+def _insert_paragraph_breaks(text: str, n_paragraphs: int) -> str:
+    """Insert blank lines between paragraphs if the LLM omitted them.
+
+    Splits on sentence boundaries ('. ' followed by uppercase) to
+    approximate even-length paragraphs. Only runs when the text has
+    fewer than ``n_paragraphs - 1`` existing blank lines.
+
+    Args:
+        text: Narrative text, possibly a single block.
+        n_paragraphs: Expected number of paragraphs.
+
+    Returns:
+        Text with ``\\n\\n`` between paragraphs.
+    """
+    if n_paragraphs <= 1:
+        return text
+
+    existing_breaks: int = text.count("\n\n")
+    if existing_breaks >= n_paragraphs - 1:
+        return text
+
+    # Split on sentence boundaries: period + space + uppercase letter
+    import re as _re
+
+    parts: list[str] = _re.split(r"(?<=\. )(?=[A-Z])", text)
+    if len(parts) < n_paragraphs:
+        return text
+
+    # Distribute sentences as evenly as possible across paragraphs
+    per_para: int = len(parts) // n_paragraphs
+    paragraphs: list[str] = []
+    for i in range(n_paragraphs):
+        start: int = i * per_para
+        end: int = (i + 1) * per_para if i < n_paragraphs - 1 else len(parts)
+        paragraphs.append("".join(parts[start:end]).strip())
+
+    return "\n\n".join(paragraphs)
 
 
 def _validate_narrative(
@@ -3239,6 +3889,11 @@ _COMPOSITE_METRIC_HINTS: dict[str, str] = {
     # surfaces the ``social:hn:<id>`` rows (stored under series_id='USINFO')
     # alongside the three FRED USINFO rows.
     "hn_labor_sentiment": "USINFO",
+    # Phase 15: Topic analysis slice uses the same USINFO hint to surface
+    # HN social refs alongside FRED USINFO metadata.
+    "hn_topic_analysis": "USINFO",
+    "nlp_topic_sentiment": "USINFO",
+    "nlp_cross_domain": "USINFO",
 }
 
 
@@ -3362,9 +4017,10 @@ def _extract_citations(
         return "" if tag_id in seen_valid else match.group(0)
 
     stripped: str = _REF_TAG_RE.sub(_replace_valid, narrative)
-    # Collapse double spaces introduced by tag removal
-    stripped = re.sub(r"\s{2,}", " ", stripped)
-    stripped = re.sub(r"\s+([,.;:!?])", r"\1", stripped)
+    # Collapse double spaces introduced by tag removal (preserve paragraph
+    # breaks — only collapse horizontal whitespace, not newlines)
+    stripped = re.sub(r"[^\S\n]{2,}", " ", stripped)
+    stripped = re.sub(r"[^\S\n]+([,.;:!?])", r"\1", stripped)
     stripped = stripped.strip()
 
     return stripped, records, warnings
@@ -3425,11 +4081,14 @@ def generate_insight(
     try:
         raw_response: str = _call_llm(model, user_prompt)
         narrative: str = _parse_narrative(raw_response)
+        n_paragraphs: int = slice_config.get("paragraphs", 1)
+        if n_paragraphs > 1:
+            narrative = _insert_paragraph_breaks(narrative, n_paragraphs)
         stripped_narrative, citation_records, citation_warnings = (
             _extract_citations(narrative, provided)
         )
         # Validator counts only LLM-emitted citations; the auto-attached
-        # scholarly context below is for dashboard display, not RULE 7.
+        # context below is for dashboard display, not RULE 7.
         llm_citation_count: int = len(citation_records)
         # Surface every retrieved scholarly chunk as a source on the
         # dashboard, even when the LLM did not emit a [ref:N] tag for it.
@@ -3454,6 +4113,32 @@ def generate_insight(
                     "excerpt": excerpt,
                 }
             )
+        # Invariant: every insight displays at least 3 RAG sources in
+        # the dashboard "Show sources" panel. If scholarly auto-attach
+        # alone didn't reach 3, pad with remaining retrieved chunks
+        # (FRED metadata, social refs) in retrieval-score order.
+        _MIN_DISPLAY_SOURCES: int = 3
+        if len(citation_records) < _MIN_DISPLAY_SOURCES:
+            cited_ids = {r["ref_id"] for r in citation_records}
+            for doc_id, chunk in provided.items():
+                if len(citation_records) >= _MIN_DISPLAY_SOURCES:
+                    break
+                if doc_id in cited_ids:
+                    continue
+                excerpt = chunk.content.strip()
+                if len(excerpt) > 240:
+                    excerpt = excerpt[:237].rstrip() + "..."
+                citation_records.append(
+                    {
+                        "ref_id": doc_id,
+                        "doc_type": chunk.doc_type,
+                        "series_id": chunk.series_id,
+                        "title": chunk.title,
+                        "source_url": chunk.source_url,
+                        "excerpt": excerpt,
+                    }
+                )
+                cited_ids.add(doc_id)
         warnings: list[str] = _validate_narrative(
             stripped_narrative,
             metric_key,

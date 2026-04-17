@@ -25,6 +25,9 @@ HACKERNEWS_SCHEMA_SQL: str = (
 REFERENCE_SCHEMA_SQL: str = (
     ai_insights.PROJECT_ROOT / "sql" / "06_reference_schema.sql"
 ).read_text()
+TOPIC_SCHEMA_SQL: str = (
+    ai_insights.PROJECT_ROOT / "sql" / "08_topic_schema.sql"
+).read_text()
 
 # ---------------------------------------------------------------------------
 # Test data helpers
@@ -60,6 +63,7 @@ def _make_test_db() -> sqlite3.Connection:
     conn.executescript(SCHEMA_SQL)
     conn.executescript(HACKERNEWS_SCHEMA_SQL)
     conn.executescript(REFERENCE_SCHEMA_SQL)
+    conn.executescript(TOPIC_SCHEMA_SQL)
 
     for meta in SERIES_META:
         conn.execute(
@@ -204,6 +208,37 @@ def _make_test_db() -> sqlite3.Connection:
             "(month, mean_sentiment, story_count, layoff_story_count) "
             "VALUES (?, ?, ?, ?)",
             (d, sentiment, 30, 6 if i >= 12 else 2),
+        )
+
+    # Phase 15: seed topic tables so the hn_topic_analysis slice works.
+    conn.execute(
+        "INSERT INTO hn_topics (topic_id, label, top_terms, story_count) "
+        "VALUES (0, 'AI Automation', '[\"ai\",\"replace\",\"jobs\"]', 40)"
+    )
+    conn.execute(
+        "INSERT INTO hn_topics (topic_id, label, top_terms, story_count) "
+        "VALUES (1, 'Tech Layoffs', '[\"layoffs\",\"tech\",\"workers\"]', 30)"
+    )
+    conn.execute(
+        "INSERT INTO hn_topics (topic_id, label, top_terms, story_count) "
+        "VALUES (2, 'Career Advice', '[\"job\",\"career\",\"engineer\"]', 20)"
+    )
+
+    # Seed a few hn_stories + topic assignments for the context/claims queries
+    for i in range(1, 10):
+        month: str = months[i % len(months)]
+        conn.execute(
+            "INSERT INTO hn_stories (story_id, created_utc, month, title, "
+            "text_excerpt, score, num_comments, hn_permalink, "
+            "sentiment_score, sentiment_label) "
+            "VALUES (?, ?, ?, 'Test story', 'test', 10, 5, "
+            "'https://hn.example.com', ?, 'neutral')",
+            (i, f"{month[:7]}-15T00:00:00", month, -0.1 + i * 0.02),
+        )
+        conn.execute(
+            "INSERT INTO hn_topic_assignments (story_id, topic_id, score) "
+            "VALUES (?, ?, ?)",
+            (i, i % 3, 0.5),
         )
 
     conn.commit()
@@ -1210,3 +1245,136 @@ class TestHnLaborSentiment:
         citations: list[dict[str, Any]] = json.loads(row[0])
         assert len(citations) >= 1
         assert citations[0]["ref_id"] == 9001
+
+
+class TestHnTopicAnalysis:
+    """Tests for the Phase 15 hn_topic_analysis insight slice."""
+
+    def test_routing_in_composite_hints(self) -> None:
+        """hn_topic_analysis routes through USINFO hint."""
+        assert ai_insights._COMPOSITE_METRIC_HINTS["hn_topic_analysis"] == "USINFO"
+        assert (
+            ai_insights._series_hint_for_metric("hn_topic_analysis") == "USINFO"
+        )
+
+    def test_hn_topic_analysis_slice_in_insight_slices(self) -> None:
+        """The new slice appears in INSIGHT_SLICES."""
+        keys: list[str] = [s["metric_key"] for s in ai_insights.INSIGHT_SLICES]
+        assert "hn_topic_analysis" in keys
+
+    def test_context_hn_topic_analysis_returns_required_keys(
+        self, test_db: sqlite3.Connection
+    ) -> None:
+        """Context builder returns the expected dict shape."""
+        ctx: dict[str, Any] = ai_insights._context_hn_topic_analysis(test_db)
+        assert "context_text" in ctx
+        assert "data_points" in ctx
+        dp: dict[str, Any] = ctx["data_points"]
+        assert dp, "data_points should not be empty with the test fixture"
+        for key in (
+            "topic_count",
+            "dominant_topic",
+            "dominant_topic_count",
+            "most_negative_topic",
+            "most_negative_sentiment",
+            "layoff_volume_trend",
+        ):
+            assert key in dp, f"Missing data_point key: {key}"
+
+    def test_context_empty_topics(self) -> None:
+        """Context returns empty data_points when no topics exist."""
+        conn: sqlite3.Connection = sqlite3.connect(":memory:")
+        conn.executescript(TOPIC_SCHEMA_SQL)
+        ctx: dict[str, Any] = ai_insights._context_hn_topic_analysis(conn)
+        assert ctx["data_points"] == {}
+        conn.close()
+
+    def test_claims_hn_topic_analysis_uses_existing_verifier_types(
+        self, test_db: sqlite3.Connection
+    ) -> None:
+        """Every claim uses an aggregation in the existing verifier registry."""
+        import verify_insights
+
+        valid_aggs: set[str] = set(verify_insights.VERIFIERS.keys())
+        claims: list[dict[str, Any]] = ai_insights._claims_hn_topic_analysis(
+            test_db
+        )
+        assert len(claims) > 0
+        for claim in claims:
+            assert claim["aggregation"] in valid_aggs, (
+                f"Unknown aggregation type: {claim['aggregation']}"
+            )
+
+
+class TestNlpTopicSentiment:
+    """Tests for the nlp_topic_sentiment insight slice."""
+
+    def test_routing_in_composite_hints(self) -> None:
+        """nlp_topic_sentiment routes through USINFO hint."""
+        assert ai_insights._COMPOSITE_METRIC_HINTS["nlp_topic_sentiment"] == "USINFO"
+
+    def test_slice_in_insight_slices(self) -> None:
+        """The slice appears in INSIGHT_SLICES."""
+        keys: list[str] = [s["metric_key"] for s in ai_insights.INSIGHT_SLICES]
+        assert "nlp_topic_sentiment" in keys
+
+    def test_context_returns_required_keys(
+        self, test_db: sqlite3.Connection
+    ) -> None:
+        """Context builder returns the expected dict shape."""
+        ctx: dict[str, Any] = ai_insights._context_nlp_topic_sentiment(test_db)
+        assert "context_text" in ctx
+        assert "data_points" in ctx
+        dp: dict[str, Any] = ctx["data_points"]
+        for key in ("topic_count", "dominant_topic", "most_negative_topic"):
+            assert key in dp, f"Missing data_point key: {key}"
+
+    def test_claims_use_existing_verifier_types(
+        self, test_db: sqlite3.Connection
+    ) -> None:
+        """Every claim uses an aggregation in the existing verifier registry."""
+        import verify_insights
+
+        valid_aggs: set[str] = set(verify_insights.VERIFIERS.keys())
+        claims: list[dict[str, Any]] = ai_insights._claims_nlp_topic_sentiment(
+            test_db
+        )
+        for claim in claims:
+            assert claim["aggregation"] in valid_aggs
+
+
+class TestNlpCrossDomain:
+    """Tests for the nlp_cross_domain insight slice."""
+
+    def test_routing_in_composite_hints(self) -> None:
+        """nlp_cross_domain routes through USINFO hint."""
+        assert ai_insights._COMPOSITE_METRIC_HINTS["nlp_cross_domain"] == "USINFO"
+
+    def test_slice_in_insight_slices(self) -> None:
+        """The slice appears in INSIGHT_SLICES."""
+        keys: list[str] = [s["metric_key"] for s in ai_insights.INSIGHT_SLICES]
+        assert "nlp_cross_domain" in keys
+
+    def test_context_returns_required_keys(
+        self, test_db: sqlite3.Connection
+    ) -> None:
+        """Context builder returns the expected dict shape."""
+        ctx: dict[str, Any] = ai_insights._context_nlp_cross_domain(test_db)
+        assert "context_text" in ctx
+        assert "data_points" in ctx
+        dp: dict[str, Any] = ctx["data_points"]
+        for key in ("avg_layoff_stories_6m", "avg_u6_u3_gap_6m", "usinfo_12m_change"):
+            assert key in dp, f"Missing data_point key: {key}"
+
+    def test_claims_use_existing_verifier_types(
+        self, test_db: sqlite3.Connection
+    ) -> None:
+        """Every claim uses an aggregation in the existing verifier registry."""
+        import verify_insights
+
+        valid_aggs: set[str] = set(verify_insights.VERIFIERS.keys())
+        claims: list[dict[str, Any]] = ai_insights._claims_nlp_cross_domain(
+            test_db
+        )
+        for claim in claims:
+            assert claim["aggregation"] in valid_aggs
