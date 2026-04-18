@@ -26,7 +26,32 @@ only when analyzing the actual COVID shock and recovery.
 billions of chained 2017 dollars; CPI (CPIAUCSL) is an index; employment \
 counts (USINFO, CES2023800001, CNP16OV) are thousands of persons.
 - Date format in the database is YYYY-MM-DD.
-- Keep answers in plain prose. Be concise and data-driven.\
+OUTPUT FORMAT:
+Return a JSON object with two fields:
+{
+  "narrative": "Your prose answer here.",
+  "claims": [
+    {
+      "statement": "unemployment at 4.2%",
+      "metric_type": "latest",
+      "series_id": "UNRATE",
+      "expected_value": 4.2,
+      "date_range": ["2026-02", "2026-02"]
+    }
+  ]
+}
+
+CLAIM RULES:
+- Every numeric assertion in the narrative MUST have a corresponding claim.
+- metric_type must be one of: latest, change_pct, average, direction, \
+count_months_below, count_months_above, prediction_latest, \
+prediction_at_date, prediction_direction, pct_of_start.
+- For conceptual answers with no numeric data, set claims to an empty array.
+- For off-topic refusals, respond in plain text with no JSON wrapper.
+- date_range is [period_start, period_end] in YYYY-MM format.
+- For per-capita normalized claims, add "per_capita": true.
+- For raw (non-COVID-adjusted) claims, add "use_raw": true.
+- Be concise and data-driven.\
 """
 
 SQL_TOOL_CONTEXT: str = """\

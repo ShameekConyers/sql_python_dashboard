@@ -6,6 +6,7 @@ produces a final answer or the recursion limit is hit.
 
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import dataclass, field
 from typing import Annotated, TypedDict
 
@@ -23,6 +24,10 @@ from langgraph.prebuilt import ToolNode
 from src.agent.config import AgentConfig
 from src.agent.prompts import AGENT_SYSTEM_PROMPT, SQL_TOOL_CONTEXT
 from src.agent.tools.sql_tool import make_sql_tool
+from src.agent.tools.verify_tool import (
+    parse_agent_response,
+    verify_all_claims,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -233,4 +238,27 @@ def run_agent(
     if isinstance(final_msg, AIMessage):
         answer = final_msg.content or ""
 
-    return AgentResponse(answer=answer, tool_calls=tool_calls_log)
+    # Phase 17: parse structured claims and verify against DB.
+    narrative, claims = parse_agent_response(answer)
+    verification = verify_all_claims(claims, config.db_path)
+
+    return AgentResponse(
+        answer=narrative,
+        tool_calls=tool_calls_log,
+        claims=[dataclasses.asdict(c) for c in claims],
+        verification={
+            "status": verification.status,
+            "all_verified": verification.all_verified,
+            "results": [
+                {
+                    "statement": r.claim.statement,
+                    "passed": r.passed,
+                    "actual_value": r.actual_value,
+                    "reason": r.reason,
+                }
+                for r in verification.results
+            ],
+            "total": verification.total,
+            "passed_count": verification.passed_count,
+        },
+    )

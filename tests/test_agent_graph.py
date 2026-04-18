@@ -5,6 +5,7 @@ All tests mock the LLM so they run without Ollama or API keys.
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from unittest.mock import MagicMock, patch
 
@@ -262,3 +263,59 @@ class TestRunAgent:
             result = run_agent("endless loop", test_config)
 
         assert "couldn't answer" in result.answer.lower()
+
+    def test_structured_json_populates_claims(
+        self, test_config: AgentConfig
+    ) -> None:
+        """LLM returning structured JSON populates claims and verification."""
+        llm_output = json.dumps({
+            "narrative": "The latest unemployment rate is 4.4%.",
+            "claims": [
+                {
+                    "statement": "unemployment at 4.4%",
+                    "metric_type": "latest",
+                    "series_id": "UNRATE",
+                    "expected_value": 4.4,
+                    "date_range": ["2026-02", "2026-02"],
+                }
+            ],
+        })
+        mock_response = AIMessage(content=llm_output)
+
+        with patch("src.agent.graph._build_llm") as mock_build:
+            mock_llm = MagicMock()
+            mock_llm.bind_tools.return_value = mock_llm
+            mock_llm.invoke.return_value = mock_response
+            mock_build.return_value = mock_llm
+
+            result = run_agent("What is unemployment?", test_config)
+
+        assert result.answer == "The latest unemployment rate is 4.4%."
+        assert len(result.claims) == 1
+        assert result.claims[0]["series_id"] == "UNRATE"
+        assert result.verification["status"] == "Verified"
+        assert result.verification["all_verified"] is True
+        assert result.verification["total"] == 1
+        assert result.verification["passed_count"] == 1
+
+    def test_plain_text_empty_verification(
+        self, test_config: AgentConfig
+    ) -> None:
+        """LLM returning plain text gets empty claims and Verified status."""
+        refusal = (
+            "I can only answer questions about the economic data "
+            "in this dashboard."
+        )
+        mock_response = AIMessage(content=refusal)
+
+        with patch("src.agent.graph._build_llm") as mock_build:
+            mock_llm = MagicMock()
+            mock_llm.bind_tools.return_value = mock_llm
+            mock_llm.invoke.return_value = mock_response
+            mock_build.return_value = mock_llm
+
+            result = run_agent("What's the weather?", test_config)
+
+        assert result.claims == []
+        assert result.verification["status"] == "Verified"
+        assert result.verification["all_verified"] is True
