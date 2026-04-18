@@ -1,0 +1,236 @@
+"""LangGraph ReAct agent for natural-language SQL queries.
+
+Builds a two-node state graph (agent + tools) that loops until the LLM
+produces a final answer or the recursion limit is hit.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Annotated, TypedDict
+
+from langchain_core.language_models.chat_models import BaseChatModel
+from langchain_core.messages import (
+    AIMessage,
+    BaseMessage,
+    HumanMessage,
+    SystemMessage,
+)
+from langgraph.graph import END, StateGraph
+from langgraph.graph.message import add_messages
+from langgraph.prebuilt import ToolNode
+
+from src.agent.config import AgentConfig
+from src.agent.prompts import AGENT_SYSTEM_PROMPT, SQL_TOOL_CONTEXT
+from src.agent.tools.sql_tool import make_sql_tool
+
+
+# ---------------------------------------------------------------------------
+# State
+# ---------------------------------------------------------------------------
+
+
+class AgentState(TypedDict):
+    """LangGraph state carrying the full message list."""
+
+    messages: Annotated[list[BaseMessage], add_messages]
+
+
+# ---------------------------------------------------------------------------
+# Response dataclass
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class AgentResponse:
+    """Structured output returned by :func:`run_agent`.
+
+    Attributes:
+        answer: Prose answer or off-topic refusal.
+        tool_calls: Log of SQL queries the agent executed during the
+            ReAct loop.
+        claims: Placeholder for Phase 17 claim extraction.
+        verification: Placeholder for Phase 17 verification results.
+    """
+
+    answer: str
+    tool_calls: list[dict] = field(default_factory=list)
+    claims: list = field(default_factory=list)
+    verification: dict = field(default_factory=dict)
+
+
+# ---------------------------------------------------------------------------
+# LLM factory
+# ---------------------------------------------------------------------------
+
+
+def _build_llm(config: AgentConfig) -> BaseChatModel:
+    """Instantiate an LLM backend from *config*.
+
+    Args:
+        config: Agent configuration with provider and model details.
+
+    Returns:
+        A LangChain chat model ready for tool binding.
+
+    Raises:
+        ValueError: If the provider is not supported.
+    """
+    if config.provider == "ollama":
+        from langchain_ollama import ChatOllama
+
+        return ChatOllama(
+            model=config.model_name, temperature=config.temperature
+        )
+    if config.provider == "anthropic":
+        from langchain_anthropic import ChatAnthropic
+
+        return ChatAnthropic(
+            model=config.model_name, temperature=config.temperature
+        )
+    if config.provider == "openai":
+        from langchain_openai import ChatOpenAI
+
+        return ChatOpenAI(
+            model=config.model_name, temperature=config.temperature
+        )
+    raise ValueError(f"Unsupported provider: {config.provider!r}")
+
+
+# ---------------------------------------------------------------------------
+# Graph construction
+# ---------------------------------------------------------------------------
+
+
+def _should_continue(state: AgentState) -> str:
+    """Route after the agent node: tool calls go to tools, else END.
+
+    Args:
+        state: Current graph state with the message list.
+
+    Returns:
+        ``"tools"`` if the last message has tool calls, ``"end"``
+        otherwise.
+    """
+    last = state["messages"][-1]
+    if hasattr(last, "tool_calls") and last.tool_calls:
+        return "tools"
+    return "end"
+
+
+def build_graph(
+    config: AgentConfig,
+) -> StateGraph:
+    """Construct and compile the ReAct agent graph.
+
+    Args:
+        config: Agent configuration (provider, model, db_path, etc.).
+
+    Returns:
+        A compiled LangGraph ``StateGraph`` ready for invocation.
+    """
+    sql_tool = make_sql_tool(config.db_path)
+    llm = _build_llm(config)
+    llm_with_tools = llm.bind_tools([sql_tool])
+
+    def agent_node(state: AgentState) -> dict:
+        """Invoke the LLM with the current message history.
+
+        Args:
+            state: Current graph state.
+
+        Returns:
+            Dict with the new messages list containing the LLM response.
+        """
+        response = llm_with_tools.invoke(state["messages"])
+        return {"messages": [response]}
+
+    graph = StateGraph(AgentState)
+    graph.add_node("agent", agent_node)
+    graph.add_node("tools", ToolNode([sql_tool]))
+    graph.set_entry_point("agent")
+    graph.add_conditional_edges(
+        "agent",
+        _should_continue,
+        {"tools": "tools", "end": END},
+    )
+    graph.add_edge("tools", "agent")
+    return graph.compile()
+
+
+# ---------------------------------------------------------------------------
+# Public entry point
+# ---------------------------------------------------------------------------
+
+
+def run_agent(
+    question: str,
+    config: AgentConfig,
+    history: list[dict] | None = None,
+) -> AgentResponse:
+    """Run the ReAct agent on a user question.
+
+    Args:
+        question: Natural-language question about the economic data.
+        config: Agent configuration.
+        history: Optional prior conversation turns. Each dict should
+            have ``"role"`` (``"user"`` or ``"assistant"``) and
+            ``"content"`` keys. Only the last
+            ``config.max_history_turns`` turns are used.
+
+    Returns:
+        An :class:`AgentResponse` with the prose answer and a log of
+        any SQL tool calls made during the ReAct loop.
+    """
+    system_content = AGENT_SYSTEM_PROMPT + "\n\n" + SQL_TOOL_CONTEXT
+    messages: list[BaseMessage] = [SystemMessage(content=system_content)]
+
+    if history:
+        recent = history[-config.max_history_turns :]
+        for turn in recent:
+            role = turn.get("role", "")
+            content = turn.get("content", "")
+            if role == "user":
+                messages.append(HumanMessage(content=content))
+            elif role == "assistant":
+                messages.append(AIMessage(content=content))
+
+    messages.append(HumanMessage(content=question))
+
+    compiled = build_graph(config)
+
+    try:
+        result = compiled.invoke(
+            {"messages": messages},
+            config={"recursion_limit": config.recursion_limit},
+        )
+    except Exception as exc:
+        # Catch GraphRecursionError or any other runtime failure.
+        if "recursion" in str(exc).lower():
+            return AgentResponse(
+                answer=(
+                    "I couldn't answer within the allowed steps. "
+                    "Try rephrasing your question or asking something "
+                    "more specific."
+                ),
+            )
+        raise
+
+    # Extract final answer and tool call log.
+    all_messages = result["messages"]
+    answer = ""
+    tool_calls_log: list[dict] = []
+
+    for msg in all_messages:
+        if hasattr(msg, "tool_calls") and msg.tool_calls:
+            for tc in msg.tool_calls:
+                tool_calls_log.append(
+                    {"name": tc["name"], "args": tc["args"]}
+                )
+
+    # The final message should be the agent's prose answer.
+    final_msg = all_messages[-1]
+    if isinstance(final_msg, AIMessage):
+        answer = final_msg.content or ""
+
+    return AgentResponse(answer=answer, tool_calls=tool_calls_log)

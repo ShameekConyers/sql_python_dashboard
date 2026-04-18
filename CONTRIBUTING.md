@@ -114,6 +114,36 @@ refs. The selection is capped at ~260 rows to keep ChromaDB growth and
 retrieval signal-to-noise within budget. HN sentiment is a self-selected
 tech-practitioner signal, not a representative labor-market measure.
 
+## Agent Setup (Ask the Data)
+
+The project includes a LangGraph ReAct agent that answers natural-language
+questions by generating and executing SQL against the database. It defaults
+to local inference via Ollama (no API key needed).
+
+1. Install [Ollama](https://ollama.ai) and pull the default model:
+   ```bash
+   ollama pull llama3.1:8b
+   ```
+2. Verify Ollama is running:
+   ```bash
+   curl http://localhost:11434/api/tags
+   ```
+3. Test the agent from Python:
+   ```python
+   from src.agent import run_agent, AgentConfig
+
+   config = AgentConfig()  # defaults to ollama + llama3.1:8b + data/seed.db
+   result = run_agent("What is the latest unemployment rate?", config)
+   print(result.answer)
+   ```
+
+To use a cloud provider instead, set environment variables:
+```bash
+export AGENT_PROVIDER=anthropic
+export AGENT_MODEL=claude-sonnet-4-20250514
+export ANTHROPIC_API_KEY=sk-...
+```
+
 ## Running Tests
 
 ```bash
