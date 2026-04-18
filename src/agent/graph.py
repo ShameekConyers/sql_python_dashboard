@@ -22,7 +22,8 @@ from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
 
 from src.agent.config import AgentConfig
-from src.agent.prompts import AGENT_SYSTEM_PROMPT, SQL_TOOL_CONTEXT
+from src.agent.prompts import AGENT_SYSTEM_PROMPT, RAG_TOOL_CONTEXT, SQL_TOOL_CONTEXT
+from src.agent.tools.rag_tool import make_rag_tool
 from src.agent.tools.sql_tool import make_sql_tool
 from src.agent.tools.verify_tool import (
     parse_agent_response,
@@ -51,11 +52,17 @@ class AgentResponse:
     """Structured output returned by :func:`run_agent`.
 
     Attributes:
-        answer: Prose answer or off-topic refusal.
-        tool_calls: Log of SQL queries the agent executed during the
-            ReAct loop.
-        claims: Placeholder for Phase 17 claim extraction.
-        verification: Placeholder for Phase 17 verification results.
+        answer: Prose answer (extracted narrative) or off-topic refusal.
+        tool_calls: Log of tool invocations (SQL queries and RAG
+            retrievals) the agent executed during the ReAct loop.
+        claims: Parsed structured claims from the agent's JSON output.
+            Each claim is a dict with keys like ``statement``,
+            ``metric_type``, ``series_id``, ``expected_value``, and
+            ``date_range``.
+        verification: Aggregate verification result dict with keys
+            ``status``, ``all_verified``, ``results``, ``total``, and
+            ``passed_count``. Each entry in ``results`` contains the
+            claim statement, pass/fail, actual value, and reason.
     """
 
     answer: str
@@ -135,8 +142,10 @@ def build_graph(
         A compiled LangGraph ``StateGraph`` ready for invocation.
     """
     sql_tool = make_sql_tool(config.db_path)
+    rag_tool = make_rag_tool()
+    tools = [sql_tool, rag_tool]
     llm = _build_llm(config)
-    llm_with_tools = llm.bind_tools([sql_tool])
+    llm_with_tools = llm.bind_tools(tools)
 
     def agent_node(state: AgentState) -> dict:
         """Invoke the LLM with the current message history.
@@ -152,7 +161,7 @@ def build_graph(
 
     graph = StateGraph(AgentState)
     graph.add_node("agent", agent_node)
-    graph.add_node("tools", ToolNode([sql_tool]))
+    graph.add_node("tools", ToolNode(tools))
     graph.set_entry_point("agent")
     graph.add_conditional_edges(
         "agent",
@@ -187,7 +196,13 @@ def run_agent(
         An :class:`AgentResponse` with the prose answer and a log of
         any SQL tool calls made during the ReAct loop.
     """
-    system_content = AGENT_SYSTEM_PROMPT + "\n\n" + SQL_TOOL_CONTEXT
+    system_content = (
+        AGENT_SYSTEM_PROMPT
+        + "\n\n"
+        + SQL_TOOL_CONTEXT
+        + "\n\n"
+        + RAG_TOOL_CONTEXT
+    )
     messages: list[BaseMessage] = [SystemMessage(content=system_content)]
 
     if history:

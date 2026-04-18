@@ -69,7 +69,7 @@ def test_config(test_db: str) -> AgentConfig:
         provider="ollama",
         model_name="llama3.1:8b",
         temperature=0.1,
-        recursion_limit=6,
+        recursion_limit=10,
         db_path=test_db,
         max_history_turns=5,
     )
@@ -154,8 +154,34 @@ class TestBuildGraph:
             build_graph(test_config)
             mock_llm.bind_tools.assert_called_once()
             tools = mock_llm.bind_tools.call_args[0][0]
-            assert len(tools) == 1
-            assert tools[0].name == "execute_sql"
+            tool_names: list[str] = [t.name for t in tools]
+            assert "execute_sql" in tool_names
+
+    def test_rag_tool_bound(self, test_config: AgentConfig) -> None:
+        """The RAG tool is bound to the LLM during graph construction."""
+        with patch(
+            "src.agent.graph._build_llm"
+        ) as mock_build:
+            mock_llm = MagicMock()
+            mock_llm.bind_tools.return_value = mock_llm
+            mock_build.return_value = mock_llm
+            build_graph(test_config)
+            mock_llm.bind_tools.assert_called_once()
+            tools = mock_llm.bind_tools.call_args[0][0]
+            tool_names: list[str] = [t.name for t in tools]
+            assert "retrieve_context" in tool_names
+
+    def test_both_tools_bound(self, test_config: AgentConfig) -> None:
+        """Both SQL and RAG tools are bound together."""
+        with patch(
+            "src.agent.graph._build_llm"
+        ) as mock_build:
+            mock_llm = MagicMock()
+            mock_llm.bind_tools.return_value = mock_llm
+            mock_build.return_value = mock_llm
+            build_graph(test_config)
+            tools = mock_llm.bind_tools.call_args[0][0]
+            assert len(tools) == 2
 
 
 class TestAgentResponse:
@@ -297,6 +323,25 @@ class TestRunAgent:
         assert result.verification["all_verified"] is True
         assert result.verification["total"] == 1
         assert result.verification["passed_count"] == 1
+
+    def test_system_content_includes_rag_context(
+        self, test_config: AgentConfig
+    ) -> None:
+        """System message includes RAG_TOOL_CONTEXT for the agent."""
+        mock_response = AIMessage(content="Answer.")
+
+        with patch("src.agent.graph._build_llm") as mock_build:
+            mock_llm = MagicMock()
+            mock_llm.bind_tools.return_value = mock_llm
+            mock_llm.invoke.return_value = mock_response
+            mock_build.return_value = mock_llm
+
+            run_agent("What is the yield curve?", test_config)
+
+            call_args = mock_llm.invoke.call_args[0][0]
+            system_msg = call_args[0]
+            assert isinstance(system_msg, SystemMessage)
+            assert "REFERENCE KNOWLEDGE BASE" in system_msg.content
 
     def test_plain_text_empty_verification(
         self, test_config: AgentConfig

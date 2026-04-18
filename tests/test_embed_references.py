@@ -386,3 +386,62 @@ class TestBuildIndexIncludesSocial:
         kwargs = fake_collection.upsert.call_args.kwargs
         assert kwargs["metadatas"][0]["doc_type"] == "social:hn:12345"
         assert kwargs["metadatas"][0]["series_id"] == "USINFO"
+
+
+# ---------------------------------------------------------------------------
+# build_index picks up concept doc_type rows (Phase 18)
+# ---------------------------------------------------------------------------
+
+
+class TestBuildIndexIncludesConcepts:
+    """Concept reference_docs rows flow through chunking into upsert metadata."""
+
+    def test_build_index_includes_concept_doc_type(
+        self, tmp_path: Path
+    ) -> None:
+        """Upsert metadata preserves ``concept:<slug>`` doc_type values."""
+        import numpy as np
+
+        db_path: Path = tmp_path / "seed.db"
+        conn: sqlite3.Connection = sqlite3.connect(db_path)
+        conn.executescript(
+            """
+            CREATE TABLE reference_docs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                series_id TEXT, doc_type TEXT, title TEXT,
+                content TEXT, source_url TEXT, fetched_at TEXT
+            );
+            INSERT INTO reference_docs
+              (series_id, doc_type, title, content, source_url, fetched_at)
+              VALUES
+              ('_CROSS_SERIES', 'concept:yield_curve',
+               'The Yield Curve and Economic Forecasting',
+               'The yield curve plots U.S. Treasury bond yields.',
+               '', '2026-04-18');
+            """
+        )
+        conn.commit()
+        conn.close()
+
+        fake_model = MagicMock()
+        fake_model.encode.return_value = np.zeros((1, 4))
+        fake_collection = MagicMock()
+
+        with (
+            patch.object(embed_references, "DATA_DIR", tmp_path),
+            patch.object(embed_references, "CHROMA_DIR", tmp_path / ".chroma"),
+            patch.object(
+                embed_references, "_load_model", return_value=fake_model
+            ),
+            patch.object(
+                embed_references,
+                "_get_or_create_collection",
+                return_value=fake_collection,
+            ),
+        ):
+            embed_references.build_index(mode="seed")
+
+        fake_collection.upsert.assert_called_once()
+        kwargs = fake_collection.upsert.call_args.kwargs
+        assert kwargs["metadatas"][0]["doc_type"] == "concept:yield_curve"
+        assert kwargs["metadatas"][0]["series_id"] == "_CROSS_SERIES"

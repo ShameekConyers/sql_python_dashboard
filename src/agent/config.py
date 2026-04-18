@@ -17,9 +17,14 @@ class AgentConfig:
         temperature: Sampling temperature. Low values produce more
             deterministic, factual answers.
         recursion_limit: Maximum LangGraph graph steps. Each tool call
-            costs 2 steps (agent to tool + tool to agent). A limit of 6
-            allows up to 2 full SQL round-trips plus a final synthesis.
+            costs 2 steps (agent to tool + tool to agent). A limit of 10
+            accommodates RAG + SQL in one turn (each tool call costs 2
+            steps; an agent using both tools twice needs 8 steps + final
+            synthesis = 10).
         db_path: Path to the SQLite database (``seed.db`` or ``full.db``).
+        chroma_path: Path to the ChromaDB persist directory. Used for
+            documentation and future override; the RAG tool reads from
+            the module-level constant in ``rag_retrieval.py``.
         max_history_turns: Sliding-window size for conversation history.
     """
 
@@ -33,10 +38,13 @@ class AgentConfig:
         default_factory=lambda: float(os.getenv("AGENT_TEMPERATURE", "0.1"))
     )
     recursion_limit: int = field(
-        default_factory=lambda: int(os.getenv("AGENT_RECURSION_LIMIT", "6"))
+        default_factory=lambda: int(os.getenv("AGENT_RECURSION_LIMIT", "10"))
     )
     db_path: str = field(
         default_factory=lambda: os.getenv("AGENT_DB_PATH", "data/seed.db")
+    )
+    chroma_path: str = field(
+        default_factory=lambda: os.getenv("AGENT_CHROMA_PATH", "data/.chroma")
     )
     max_history_turns: int = field(
         default_factory=lambda: int(os.getenv("AGENT_MAX_HISTORY", "5"))

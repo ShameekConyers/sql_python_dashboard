@@ -26,6 +26,16 @@ DATA_DIR: Path = PROJECT_ROOT / "data"
 SCHOLARLY_DIR: Path = PROJECT_ROOT / "data" / "reference_sources" / "scholarly"
 """Directory holding curated scholarly reference JSON fixtures (Phase 12)."""
 
+CONCEPTS_DIR: Path = PROJECT_ROOT / "data" / "reference_sources" / "concepts"
+"""Directory holding developer-written economic concept markdown files (Phase 18)."""
+
+_CROSS_SERIES_ID: str = "_CROSS_SERIES"
+"""Synthetic series_id sentinel for multi-series concept documents.
+
+SQLite foreign keys are opt-in via PRAGMA and the codebase does not enable
+them in db_setup, so no ``_CROSS_SERIES`` row in ``series_metadata`` is needed.
+"""
+
 HN_STORIES_PATH: Path = PROJECT_ROOT / "data" / "raw" / "hn_stories.json"
 """Cache of scored Hacker News stories written by ``sentiment_score.py``."""
 
@@ -486,6 +496,73 @@ def _load_scholarly_docs(conn: sqlite3.Connection, mode: str) -> int:
     return loaded
 
 
+def _load_concept_docs(conn: sqlite3.Connection, mode: str) -> int:
+    """Load economic concept markdown files into ``reference_docs``.
+
+    Scans ``CONCEPTS_DIR`` for ``*.md`` files, reads each file, and upserts
+    into ``reference_docs`` with ``series_id = '_CROSS_SERIES'`` and
+    ``doc_type = 'concept:<slug>'`` where slug is the filename stem. The
+    title is extracted from the first ``# heading`` in the markdown, falling
+    back to the filename stem if no heading is found.
+
+    A missing directory logs an info message and returns 0. Empty files are
+    skipped with a warning.
+
+    Args:
+        conn: Open SQLite connection.
+        mode: Either ``'seed'`` or ``'full'``. Reserved for future filtering;
+            concept rows are mode-agnostic in Phase 18.
+
+    Returns:
+        Count of rows inserted or replaced.
+    """
+    _ = mode  # reserved for future filtering
+
+    if not CONCEPTS_DIR.exists():
+        logger.info(
+            "No concepts directory at %s - skipping", CONCEPTS_DIR
+        )
+        return 0
+
+    loaded: int = 0
+
+    for path in sorted(CONCEPTS_DIR.glob("*.md")):
+        content: str = path.read_text().strip()
+        if not content:
+            logger.warning(
+                "Skipping concept file %s - empty content", path.name
+            )
+            continue
+
+        slug: str = path.stem
+        doc_type: str = f"concept:{slug}"
+
+        # Extract title from the first # heading line.
+        title: str = slug
+        for line in content.splitlines():
+            stripped: str = line.strip()
+            if stripped.startswith("# "):
+                title = stripped[2:].strip()
+                break
+
+        fetched_at: str = date.today().isoformat()
+
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO reference_docs (
+                series_id, doc_type, title, content, source_url, fetched_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (_CROSS_SERIES_ID, doc_type, title, content, "", fetched_at),
+        )
+        loaded += 1
+        logger.info("Loaded concept doc %s", slug)
+
+    conn.commit()
+    logger.info("Loaded %d concept reference_docs rows", loaded)
+    return loaded
+
+
 _HN_REQUIRED_FIELDS: tuple[str, ...] = (
     "story_id",
     "created_utc",
@@ -822,13 +899,18 @@ def _print_summary(conn: sqlite3.Connection, stats: dict[str, dict[str, int]]) -
     social_count: int = conn.execute(
         "SELECT COUNT(*) FROM reference_docs WHERE doc_type LIKE 'social:%'"
     ).fetchone()[0]
+    concept_count: int = conn.execute(
+        "SELECT COUNT(*) FROM reference_docs WHERE doc_type LIKE 'concept:%'"
+    ).fetchone()[0]
     fred_count: int = conn.execute(
         "SELECT COUNT(*) FROM reference_docs "
         "WHERE doc_type NOT LIKE 'scholarly:%' "
-        "AND doc_type NOT LIKE 'social:%'"
+        "AND doc_type NOT LIKE 'social:%' "
+        "AND doc_type NOT LIKE 'concept:%'"
     ).fetchone()[0]
     print(f"    reference_docs (FRED):   {fred_count:>6,}")
     print(f"    reference_docs (schol.): {scholarly_count:>6,}")
+    print(f"    reference_docs (concept):{concept_count:>6,}")
     print(f"    reference_docs (social): {social_count:>6,}")
 
     # HN month coverage (compact, non-essential if table is empty)
@@ -897,6 +979,7 @@ def build_database(mode: str = "seed") -> Path:
         stats: dict[str, dict[str, int]] = _load_series(conn, series_ids, cutoff_date)
         _load_reference_docs(conn, mode)
         _load_scholarly_docs(conn, mode)
+        _load_concept_docs(conn, mode)
         _load_hn_stories(conn, mode)
         _build_hn_monthly_aggregate(conn)
         _load_hn_reference_docs(conn, mode)

@@ -51,7 +51,36 @@ prediction_at_date, prediction_direction, pct_of_start.
 - date_range is [period_start, period_end] in YYYY-MM format.
 - For per-capita normalized claims, add "per_capita": true.
 - For raw (non-COVID-adjusted) claims, add "use_raw": true.
-- Be concise and data-driven.\
+- Be concise and data-driven.
+
+TOOL SELECTION:
+- Use execute_sql for data questions that require querying the database \
+(e.g., "What is the latest unemployment rate?").
+- Use retrieve_context for conceptual questions about economic indicators, \
+methodology, or definitions (e.g., "What is the yield curve?").
+- Use both tools for combined questions that need data AND context \
+(e.g., "When did the yield curve invert and what does that mean for recession risk?").
+
+CITATIONS:
+- When you use retrieve_context, cite sources in your narrative using \
+[ref:N] tags where N is the ref_id from the tool result.
+- Place citations inline near the claim they support.
+- You may cite multiple sources for one claim: [ref:1][ref:3].\
+"""
+
+RAG_TOOL_CONTEXT: str = """\
+REFERENCE KNOWLEDGE BASE:
+
+The retrieve_context tool searches a vector store containing:
+- FRED series metadata (series notes, release info, category paths)
+- Curated scholarly references (BEA, EIA, CEA publications)
+- Economic concept definitions (yield curve, unemployment rates, CPI, \
+per-capita normalization, recession indicators)
+- Hacker News tech-labor stories (social sentiment corpus)
+
+Results include [ref:N] tags. Use these tags in your narrative to cite \
+the source material. Each ref_id corresponds to a specific document \
+chunk from the knowledge base.\
 """
 
 SQL_TOOL_CONTEXT: str = """\

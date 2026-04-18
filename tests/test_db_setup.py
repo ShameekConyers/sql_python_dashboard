@@ -1511,3 +1511,131 @@ class TestLoadHnReferenceDocs:
             "WHERE doc_type LIKE 'social:hn:%'"
         ).fetchone()[0]
         assert remaining == 0
+
+
+# ---------------------------------------------------------------------------
+# _load_concept_docs (Phase 18)
+# ---------------------------------------------------------------------------
+
+
+class TestLoadConceptDocs:
+    """Tests for ``_load_concept_docs`` (Phase 18)."""
+
+    def test_loads_concept_files(
+        self, mem_conn: sqlite3.Connection, tmp_path: Path
+    ) -> None:
+        """Markdown files produce concept:<slug> reference_docs rows."""
+        concepts_dir: Path = tmp_path / "concepts"
+        concepts_dir.mkdir()
+        (concepts_dir / "yield_curve.md").write_text(
+            "# The Yield Curve\n\nContent about yield curves."
+        )
+        (concepts_dir / "cpi_inflation.md").write_text(
+            "# CPI and Inflation\n\nContent about CPI."
+        )
+
+        with patch.object(db_setup, "CONCEPTS_DIR", concepts_dir):
+            count: int = db_setup._load_concept_docs(mem_conn, "seed")
+
+        assert count == 2
+        rows: list[tuple] = mem_conn.execute(
+            "SELECT series_id, doc_type, title FROM reference_docs "
+            "WHERE doc_type LIKE 'concept:%' ORDER BY doc_type"
+        ).fetchall()
+        assert rows[0] == ("_CROSS_SERIES", "concept:cpi_inflation", "CPI and Inflation")
+        assert rows[1] == ("_CROSS_SERIES", "concept:yield_curve", "The Yield Curve")
+
+    def test_missing_directory_returns_zero(
+        self, mem_conn: sqlite3.Connection, tmp_path: Path
+    ) -> None:
+        """Missing concepts directory returns 0 without raising."""
+        missing: Path = tmp_path / "does_not_exist"
+        with patch.object(db_setup, "CONCEPTS_DIR", missing):
+            count: int = db_setup._load_concept_docs(mem_conn, "seed")
+
+        assert count == 0
+
+    def test_empty_file_skipped(
+        self, mem_conn: sqlite3.Connection, tmp_path: Path
+    ) -> None:
+        """Empty or whitespace-only markdown files are skipped."""
+        concepts_dir: Path = tmp_path / "concepts"
+        concepts_dir.mkdir()
+        (concepts_dir / "empty.md").write_text("   \n  ")
+
+        with patch.object(db_setup, "CONCEPTS_DIR", concepts_dir):
+            count: int = db_setup._load_concept_docs(mem_conn, "seed")
+
+        assert count == 0
+
+    def test_title_fallback_to_filename(
+        self, mem_conn: sqlite3.Connection, tmp_path: Path
+    ) -> None:
+        """File without a heading uses the filename stem as title."""
+        concepts_dir: Path = tmp_path / "concepts"
+        concepts_dir.mkdir()
+        (concepts_dir / "no_heading.md").write_text(
+            "Just content with no heading line."
+        )
+
+        with patch.object(db_setup, "CONCEPTS_DIR", concepts_dir):
+            db_setup._load_concept_docs(mem_conn, "seed")
+
+        title: str = mem_conn.execute(
+            "SELECT title FROM reference_docs WHERE doc_type = 'concept:no_heading'"
+        ).fetchone()[0]
+        assert title == "no_heading"
+
+    def test_idempotent_upsert(
+        self, mem_conn: sqlite3.Connection, tmp_path: Path
+    ) -> None:
+        """Running the loader twice does not duplicate rows."""
+        concepts_dir: Path = tmp_path / "concepts"
+        concepts_dir.mkdir()
+        (concepts_dir / "test.md").write_text("# Test\n\nContent.")
+
+        with patch.object(db_setup, "CONCEPTS_DIR", concepts_dir):
+            db_setup._load_concept_docs(mem_conn, "seed")
+            db_setup._load_concept_docs(mem_conn, "seed")
+
+        row_count: int = mem_conn.execute(
+            "SELECT COUNT(*) FROM reference_docs WHERE doc_type LIKE 'concept:%'"
+        ).fetchone()[0]
+        assert row_count == 1
+
+    def test_source_url_is_empty_string(
+        self, mem_conn: sqlite3.Connection, tmp_path: Path
+    ) -> None:
+        """Concept docs have empty string as source_url (developer-written)."""
+        concepts_dir: Path = tmp_path / "concepts"
+        concepts_dir.mkdir()
+        (concepts_dir / "test.md").write_text("# Test\n\nContent.")
+
+        with patch.object(db_setup, "CONCEPTS_DIR", concepts_dir):
+            db_setup._load_concept_docs(mem_conn, "seed")
+
+        url: str = mem_conn.execute(
+            "SELECT source_url FROM reference_docs WHERE doc_type = 'concept:test'"
+        ).fetchone()[0]
+        assert url == ""
+
+    def test_series_id_is_cross_series(
+        self, mem_conn: sqlite3.Connection, tmp_path: Path
+    ) -> None:
+        """All concept docs use the _CROSS_SERIES sentinel series_id."""
+        concepts_dir: Path = tmp_path / "concepts"
+        concepts_dir.mkdir()
+        (concepts_dir / "a.md").write_text("# A\n\nContent A.")
+        (concepts_dir / "b.md").write_text("# B\n\nContent B.")
+
+        with patch.object(db_setup, "CONCEPTS_DIR", concepts_dir):
+            db_setup._load_concept_docs(mem_conn, "seed")
+
+        series_ids: list[str] = [
+            row[0]
+            for row in mem_conn.execute(
+                "SELECT DISTINCT series_id FROM reference_docs "
+                "WHERE doc_type LIKE 'concept:%'"
+            ).fetchall()
+        ]
+        assert series_ids == ["_CROSS_SERIES"]
