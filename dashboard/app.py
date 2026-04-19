@@ -17,6 +17,13 @@ import plotly.graph_objects as go
 import streamlit as st
 from plotly.subplots import make_subplots
 
+try:
+    from dashboard.ask_the_data import render_ask_the_data
+
+    _ASK_THE_DATA_AVAILABLE = True
+except ImportError:
+    _ASK_THE_DATA_AVAILABLE = False
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -1684,6 +1691,18 @@ GLOSSARY_TERMS: list[tuple[str, str]] = [
         "collection of documents. Each topic is characterized by its "
         "highest-weighted terms.",
     ),
+    (
+        "Ask the Data",
+        "A conversational AI feature that lets you ask natural-language "
+        "questions about the economic data. Answers are fact-checked "
+        "against the database and cited with reference sources.",
+    ),
+    (
+        "RAG (Retrieval-Augmented Generation)",
+        "A technique that retrieves relevant documents from a knowledge "
+        "base before generating an answer. Grounds the LLM's response "
+        "in real data instead of relying on memorized training patterns.",
+    ),
 ]
 
 with st.expander("Glossary of Economic Terms"):
@@ -2805,6 +2824,16 @@ st.markdown(
 )
 
 render_ai_insight_block("synthesis", "trend", use_full)
+
+# ---------------------------------------------------------------------------
+# Ask the Data (Phase 19)
+# ---------------------------------------------------------------------------
+
+if _ASK_THE_DATA_AVAILABLE:
+    st.header("Ask the Data")
+    _active_db = str(FULL_DB if use_full else SEED_DB)
+    _chroma_dir = str(PROJECT_ROOT / "data" / ".chroma")
+    render_ask_the_data(db_path=_active_db, chroma_path=_chroma_dir)
 
 st.divider()
 st.caption("Data source: FRED (Federal Reserve Economic Data) | Built with Streamlit + Plotly")

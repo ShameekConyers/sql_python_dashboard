@@ -10,7 +10,7 @@ import sqlite3
 from unittest.mock import MagicMock, patch
 
 import pytest
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
 from src.agent.config import AgentConfig
 from src.agent.graph import (
@@ -188,12 +188,19 @@ class TestAgentResponse:
     """Tests for the AgentResponse dataclass."""
 
     def test_defaults(self) -> None:
-        """AgentResponse has sensible defaults for Phase 16."""
+        """AgentResponse has sensible defaults."""
         resp = AgentResponse(answer="test")
         assert resp.answer == "test"
         assert resp.tool_calls == []
+        assert resp.tool_results == []
         assert resp.claims == []
         assert resp.verification == {}
+
+    def test_tool_results_field(self) -> None:
+        """AgentResponse stores tool_results when provided."""
+        results = [{"name": "execute_sql", "content": "rows", "tool_call_id": "tc1"}]
+        resp = AgentResponse(answer="test", tool_results=results)
+        assert resp.tool_results == results
 
 
 class TestRunAgent:
@@ -364,3 +371,70 @@ class TestRunAgent:
         assert result.claims == []
         assert result.verification["status"] == "Verified"
         assert result.verification["all_verified"] is True
+
+    def test_compiled_graph_skips_build(
+        self, test_config: AgentConfig
+    ) -> None:
+        """Passing compiled_graph skips build_graph entirely."""
+        answer_text = "The rate is 4.4%."
+        mock_response = AIMessage(content=answer_text)
+
+        mock_compiled = MagicMock()
+        mock_compiled.invoke.return_value = {
+            "messages": [
+                SystemMessage(content="sys"),
+                HumanMessage(content="question"),
+                mock_response,
+            ]
+        }
+
+        with patch("src.agent.graph.build_graph") as mock_bg:
+            result = run_agent(
+                "What is unemployment?",
+                test_config,
+                compiled_graph=mock_compiled,
+            )
+            mock_bg.assert_not_called()
+
+        assert result.answer == answer_text
+
+    def test_tool_results_captured(
+        self, test_config: AgentConfig
+    ) -> None:
+        """ToolMessage content is captured in AgentResponse.tool_results."""
+        tool_msg = ToolMessage(
+            content='[{"title": "CPI", "content": "measure of inflation"}]',
+            name="retrieve_context",
+            tool_call_id="tc_rag_1",
+        )
+        ai_tool_call = AIMessage(
+            content="",
+            tool_calls=[{
+                "id": "tc_rag_1",
+                "name": "retrieve_context",
+                "args": {"query": "what is CPI"},
+            }],
+        )
+        final_answer = AIMessage(content="CPI measures inflation.")
+
+        mock_compiled = MagicMock()
+        mock_compiled.invoke.return_value = {
+            "messages": [
+                SystemMessage(content="sys"),
+                HumanMessage(content="question"),
+                ai_tool_call,
+                tool_msg,
+                final_answer,
+            ]
+        }
+
+        result = run_agent(
+            "What is CPI?",
+            test_config,
+            compiled_graph=mock_compiled,
+        )
+
+        assert len(result.tool_results) == 1
+        assert result.tool_results[0]["name"] == "retrieve_context"
+        assert result.tool_results[0]["tool_call_id"] == "tc_rag_1"
+        assert "CPI" in result.tool_results[0]["content"]

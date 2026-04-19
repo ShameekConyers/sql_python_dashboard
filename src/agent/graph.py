@@ -16,6 +16,7 @@ from langchain_core.messages import (
     BaseMessage,
     HumanMessage,
     SystemMessage,
+    ToolMessage,
 )
 from langgraph.graph import END, StateGraph
 from langgraph.graph.message import add_messages
@@ -55,6 +56,10 @@ class AgentResponse:
         answer: Prose answer (extracted narrative) or off-topic refusal.
         tool_calls: Log of tool invocations (SQL queries and RAG
             retrievals) the agent executed during the ReAct loop.
+        tool_results: Log of tool results from ``ToolMessage`` objects.
+            Each dict has ``name``, ``content``, and ``tool_call_id``
+            keys. Used by the UI for "Show references" (RAG chunks)
+            and "Show query" (SQL results).
         claims: Parsed structured claims from the agent's JSON output.
             Each claim is a dict with keys like ``statement``,
             ``metric_type``, ``series_id``, ``expected_value``, and
@@ -67,6 +72,7 @@ class AgentResponse:
 
     answer: str
     tool_calls: list[dict] = field(default_factory=list)
+    tool_results: list[dict] = field(default_factory=list)
     claims: list = field(default_factory=list)
     verification: dict = field(default_factory=dict)
 
@@ -181,6 +187,7 @@ def run_agent(
     question: str,
     config: AgentConfig,
     history: list[dict] | None = None,
+    compiled_graph: object | None = None,
 ) -> AgentResponse:
     """Run the ReAct agent on a user question.
 
@@ -191,6 +198,9 @@ def run_agent(
             have ``"role"`` (``"user"`` or ``"assistant"``) and
             ``"content"`` keys. Only the last
             ``config.max_history_turns`` turns are used.
+        compiled_graph: Optional pre-compiled LangGraph graph. If
+            provided, ``build_graph(config)`` is skipped. Useful for
+            caching the graph across multiple invocations.
 
     Returns:
         An :class:`AgentResponse` with the prose answer and a log of
@@ -217,7 +227,7 @@ def run_agent(
 
     messages.append(HumanMessage(content=question))
 
-    compiled = build_graph(config)
+    compiled = compiled_graph or build_graph(config)
 
     try:
         result = compiled.invoke(
@@ -236,10 +246,11 @@ def run_agent(
             )
         raise
 
-    # Extract final answer and tool call log.
+    # Extract final answer, tool call log, and tool results.
     all_messages = result["messages"]
     answer = ""
     tool_calls_log: list[dict] = []
+    tool_results_log: list[dict] = []
 
     for msg in all_messages:
         if hasattr(msg, "tool_calls") and msg.tool_calls:
@@ -247,6 +258,12 @@ def run_agent(
                 tool_calls_log.append(
                     {"name": tc["name"], "args": tc["args"]}
                 )
+        if isinstance(msg, ToolMessage):
+            tool_results_log.append({
+                "name": msg.name,
+                "content": msg.content,
+                "tool_call_id": msg.tool_call_id,
+            })
 
     # The final message should be the agent's prose answer.
     final_msg = all_messages[-1]
@@ -260,6 +277,7 @@ def run_agent(
     return AgentResponse(
         answer=narrative,
         tool_calls=tool_calls_log,
+        tool_results=tool_results_log,
         claims=[dataclasses.asdict(c) for c in claims],
         verification={
             "status": verification.status,
@@ -267,6 +285,7 @@ def run_agent(
             "results": [
                 {
                     "statement": r.claim.statement,
+                    "expected": r.claim.expected_value,
                     "passed": r.passed,
                     "actual_value": r.actual_value,
                     "reason": r.reason,
