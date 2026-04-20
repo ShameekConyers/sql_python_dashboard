@@ -551,6 +551,13 @@ def _handle_question(
     })
     st.session_state["_ask_history"] = history
 
+    # Ensure the API key is in the environment so the LLM client can find it.
+    # st.secrets doesn't set env vars automatically.
+    for env_key in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY"):
+        val = _get_secret(env_key)
+        if val and env_key not in os.environ:
+            os.environ[env_key] = val
+
     model_name = _get_secret("AGENT_MODEL") or AgentConfig().model_name
     config = AgentConfig(
         provider=provider,
