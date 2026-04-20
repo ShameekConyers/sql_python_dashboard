@@ -168,10 +168,26 @@ def parse_agent_response(raw: str) -> tuple[str, list[Claim]]:
         # Validate required fields
         if not all(
             k in claim_dict
-            for k in ("metric_type", "series_id", "expected_value")
+            for k in ("metric_type", "series_id")
         ):
             logger.warning(
                 "Skipping claim missing required fields: %s", claim_dict
+            )
+            continue
+
+        raw_expected = claim_dict.get("expected_value")
+        if raw_expected is None:
+            logger.warning(
+                "Skipping claim with null expected_value: %s", claim_dict
+            )
+            continue
+
+        try:
+            expected_value = float(raw_expected)
+        except (TypeError, ValueError):
+            logger.warning(
+                "Skipping claim with non-numeric expected_value: %s",
+                claim_dict,
             )
             continue
 
@@ -185,7 +201,7 @@ def parse_agent_response(raw: str) -> tuple[str, list[Claim]]:
                 statement=claim_dict.get("statement", ""),
                 metric_type=claim_dict["metric_type"],
                 series_id=claim_dict["series_id"],
-                expected_value=float(claim_dict["expected_value"]),
+                expected_value=expected_value,
                 date_range=date_range,
                 use_raw=bool(claim_dict.get("use_raw", False)),
                 per_capita=bool(claim_dict.get("per_capita", False)),

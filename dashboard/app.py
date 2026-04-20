@@ -18,7 +18,7 @@ import streamlit as st
 from plotly.subplots import make_subplots
 
 try:
-    from dashboard.ask_the_data import render_ask_the_data
+    from ask_the_data import render_ask_the_data
 
     _ASK_THE_DATA_AVAILABLE = True
 except ImportError:
@@ -1545,6 +1545,15 @@ with st.sidebar:
 
     use_covid_adjusted = st.checkbox("Use COVID-adjusted values", value=True, help="Toggle ARIMA counterfactual for the COVID window")
 
+    if _ASK_THE_DATA_AVAILABLE:
+        ask_local_mode = st.toggle(
+            "Ask the Data: local mode",
+            value=False,
+            help="ON = Ollama (no key gate). OFF = cloud API (key gate active).",
+        )
+    else:
+        ask_local_mode = True
+
     st.divider()
     st.caption(f"Data range: {date_min_db} to {date_max_db}")
     st.caption(f"Observations: {run_query('SELECT COUNT(*) AS n FROM observations', use_full)['n'].iloc[0]:,}")
@@ -1579,6 +1588,28 @@ last_updated = run_query(
 )["lu"].iloc[0]
 if last_updated:
     st.caption(f"Data last updated: {last_updated}")
+
+# ---------------------------------------------------------------------------
+# Ask the Data (Phase 19)
+# ---------------------------------------------------------------------------
+
+if _ASK_THE_DATA_AVAILABLE:
+    st.header("Ask the Data")
+    _active_db = str(FULL_DB if use_full else SEED_DB)
+    _chroma_dir = str(PROJECT_ROOT / "data" / ".chroma")
+    render_ask_the_data(
+        db_path=_active_db,
+        chroma_path=_chroma_dir,
+        force_local=ask_local_mode,
+    )
+
+st.divider()
+
+# ---------------------------------------------------------------------------
+# Section A: Overview — AI intro, glossary, KPI cards
+# ---------------------------------------------------------------------------
+
+st.header("Overview")
 
 render_ai_insight_block("dashboard_intro", "trend", use_full)
 
@@ -1714,13 +1745,6 @@ with st.expander("Glossary of Economic Terms"):
             st.markdown(f"**{term}**  \n{definition}")
 
 st.divider()
-
-
-# ---------------------------------------------------------------------------
-# Section A: Overview — KPI cards + sparklines
-# ---------------------------------------------------------------------------
-
-st.header("Overview")
 
 # KPI data
 unrate_val, unrate_delta, unrate_date = get_latest_metric("UNRATE", use_full)
@@ -2824,16 +2848,6 @@ st.markdown(
 )
 
 render_ai_insight_block("synthesis", "trend", use_full)
-
-# ---------------------------------------------------------------------------
-# Ask the Data (Phase 19)
-# ---------------------------------------------------------------------------
-
-if _ASK_THE_DATA_AVAILABLE:
-    st.header("Ask the Data")
-    _active_db = str(FULL_DB if use_full else SEED_DB)
-    _chroma_dir = str(PROJECT_ROOT / "data" / ".chroma")
-    render_ask_the_data(db_path=_active_db, chroma_path=_chroma_dir)
 
 st.divider()
 st.caption("Data source: FRED (Federal Reserve Economic Data) | Built with Streamlit + Plotly")

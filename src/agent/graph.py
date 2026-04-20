@@ -7,6 +7,7 @@ produces a final answer or the recursion limit is hit.
 from __future__ import annotations
 
 import dataclasses
+import time
 from dataclasses import dataclass, field
 from typing import Annotated, TypedDict
 
@@ -68,6 +69,8 @@ class AgentResponse:
             ``status``, ``all_verified``, ``results``, ``total``, and
             ``passed_count``. Each entry in ``results`` contains the
             claim statement, pass/fail, actual value, and reason.
+        elapsed_seconds: Wall-clock time for the full agent invocation
+            (graph execution + claim verification).
     """
 
     answer: str
@@ -75,6 +78,7 @@ class AgentResponse:
     tool_results: list[dict] = field(default_factory=list)
     claims: list = field(default_factory=list)
     verification: dict = field(default_factory=dict)
+    elapsed_seconds: float = 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -229,6 +233,7 @@ def run_agent(
 
     compiled = compiled_graph or build_graph(config)
 
+    t_start: float = time.perf_counter()
     try:
         result = compiled.invoke(
             {"messages": messages},
@@ -237,12 +242,14 @@ def run_agent(
     except Exception as exc:
         # Catch GraphRecursionError or any other runtime failure.
         if "recursion" in str(exc).lower():
+            elapsed: float = time.perf_counter() - t_start
             return AgentResponse(
                 answer=(
                     "I couldn't answer within the allowed steps. "
                     "Try rephrasing your question or asking something "
                     "more specific."
                 ),
+                elapsed_seconds=round(elapsed, 2),
             )
         raise
 
@@ -274,6 +281,8 @@ def run_agent(
     narrative, claims = parse_agent_response(answer)
     verification = verify_all_claims(claims, config.db_path)
 
+    elapsed = round(time.perf_counter() - t_start, 2)
+
     return AgentResponse(
         answer=narrative,
         tool_calls=tool_calls_log,
@@ -295,4 +304,5 @@ def run_agent(
             "total": verification.total,
             "passed_count": verification.passed_count,
         },
+        elapsed_seconds=elapsed,
     )

@@ -55,6 +55,9 @@ with `sentence-transformers/all-MiniLM-L6-v2`, and persists the collection
 to `data/.chroma/`. `ai_insights.py` then retrieves from that store and
 writes `[ref:N]` citations into `ai_insights.citations_json`.
 
+`embed_references.py` must run before the agent can use RAG retrieval.
+Without it the agent still works but answers from SQL data alone.
+
 ## Hacker News Data
 
 Phase 13 adds a thinned Hacker News corpus as a tech-labor-sentiment
@@ -144,10 +147,25 @@ export AGENT_MODEL=claude-sonnet-4-20250514
 export ANTHROPIC_API_KEY=sk-...
 ```
 
+## Deployment (Streamlit Cloud)
+
+The dashboard deploys to Streamlit Cloud using `requirements.txt` (lightweight
+runtime deps only). The "Ask the Data" agent feature is available when an API
+key is configured in Streamlit secrets.
+
+1. Push the repo to GitHub.
+2. Connect the repo in [Streamlit Cloud](https://share.streamlit.io/).
+3. Set `ANTHROPIC_API_KEY` (or `OPENAI_API_KEY`) in the app's Secrets
+   settings. The agent auto-detects the available provider.
+4. ChromaDB is not included in `requirements.txt` (too heavy for Cloud cold
+   starts). The RAG retrieval tool degrades gracefully and the agent answers
+   from SQL alone.
+5. `data/seed.db` ships in the repo, no build step needed on Cloud.
+
 ## Running Tests
 
 ```bash
-pytest tests/ -v
+pytest tests/ -v   # 573 tests
 ```
 
 Tests use in-memory SQLite databases and never modify `seed.db`.

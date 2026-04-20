@@ -6,6 +6,8 @@
 *.pem
 *.crt
 credentials*.json
+.streamlit/secrets.toml
+scripts/generate_access_key.py
 
 # Data — only seed.db is committed; raw API cache, full DB, and exports are local only
 data/raw/

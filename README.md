@@ -85,6 +85,14 @@ NMF topic model (sklearn, not BERTopic) over 1,547 HN story titles and excerpts,
 
 The LLM (llama3.1:8b via Ollama, running locally) never runs live. During the build step, Python pre-computes verifiable claims from database queries, then the LLM writes prose from that context. A separate script re-queries the database for every claim and checks values within tolerance (5% relative or 0.5 absolute). The dashboard shows a verification badge on each insight block and a "Show sources" panel with per-claim results. RAG retrieval pulls relevant chunks from FRED metadata and scholarly references (federal public-domain publications) into the prompt. 21 insights ship in the seed database, all verified.
 
+### Ask the Data
+
+An interactive chat interface powered by a LangGraph ReAct agent. Type a natural-language question and get a verified, cited answer.
+
+The agent has two tools: a read-only SQL tool that queries the dashboard database and a RAG retrieval tool that searches embedded economic concept docs, FRED metadata, and scholarly references. Every numeric claim in the response is automatically verified against the database using the same tolerance system as the batch insights. Answers show a verification badge (Verified / Partially Verified / Unverified), a per-claim breakdown, and cited reference sources.
+
+Runs locally with Ollama (no API key needed) or on Streamlit Cloud with an API key.
+
 ## Tools
 
 | Tool | What it does here |
@@ -98,7 +106,8 @@ The LLM (llama3.1:8b via Ollama, running locally) never runs live. During the bu
 | Streamlit | Dashboard with caching and sidebar filters |
 | sentence-transformers | Embedding FRED metadata and scholarly docs for RAG |
 | ChromaDB | Vector store for citation retrieval |
-| Ollama (llama3.1:8b) | Local LLM for narrative generation |
+| LangGraph | ReAct agent for interactive Q&A with tool use |
+| Ollama (llama3.1:8b) | Local LLM for narrative generation and agent |
 | FRED API | 10 macroeconomic time series |
 | Algolia HN API | Hacker News story search (public, no auth) |
 
@@ -140,6 +149,6 @@ cp .env.example .env   # paste your FRED_API_KEY
 ### Tests
 
 ```bash
-.venv/bin/pytest tests/ -v   # 430 tests, ~80 seconds
+.venv/bin/pytest tests/ -v   # 573 tests
 ```
 

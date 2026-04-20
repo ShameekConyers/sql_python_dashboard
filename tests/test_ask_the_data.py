@@ -13,7 +13,12 @@ from dashboard.ask_the_data import (
     EXAMPLE_QUESTIONS,
     _build_agent_history,
     _check_agent_available,
+    _check_key_gate_required,
+    _extract_expiry_date,
     _format_ref_tags,
+    _get_remaining_seconds,
+    _is_access_active,
+    _is_key_expired,
     _render_claim_details,
     _render_references,
     _render_verification_badge,
@@ -388,3 +393,106 @@ class TestRenderWithoutCrash:
 
         render_ask_the_data("/tmp/db", "/tmp/chroma")
         # Should not raise
+
+
+# ---------------------------------------------------------------------------
+# Tests: Access key gate
+# ---------------------------------------------------------------------------
+
+
+class TestAccessKeyGate:
+    """Tests for the per-session access key gate."""
+
+    def test_ollama_skips_gate(self, mock_st: MagicMock) -> None:
+        """Ollama provider never requires the key gate."""
+        assert _check_key_gate_required("ollama") is False
+
+    def test_anthropic_requires_gate_when_keys_configured(
+        self, mock_st: MagicMock
+    ) -> None:
+        """Anthropic provider requires gate when access keys exist."""
+        mock_st.secrets = {"access_keys": {"keys": ["demo2026a"]}}
+        assert _check_key_gate_required("anthropic") is True
+
+    def test_anthropic_skips_gate_when_no_keys(
+        self, mock_st: MagicMock
+    ) -> None:
+        """Anthropic provider skips gate when no access keys are configured."""
+        mock_st.secrets = {}
+        assert _check_key_gate_required("anthropic") is False
+
+    def test_openai_requires_gate(self, mock_st: MagicMock) -> None:
+        """OpenAI provider requires gate when access keys exist."""
+        mock_st.secrets = {"access_keys": {"keys": ["key1"]}}
+        assert _check_key_gate_required("openai") is True
+
+    def test_valid_key_activates_session(self, mock_st: MagicMock) -> None:
+        """Entering a valid key sets _ask_key_activated_at in session state."""
+        from datetime import datetime
+
+        mock_st.session_state["_ask_key_activated_at"] = datetime.now()
+        assert _is_access_active() is True
+
+    def test_expired_key_deactivates(self, mock_st: MagicMock) -> None:
+        """Key entered more than 2 minutes ago is expired."""
+        from datetime import datetime, timedelta
+
+        mock_st.session_state["_ask_key_activated_at"] = (
+            datetime.now() - timedelta(minutes=3)
+        )
+        assert _is_access_active() is False
+
+    def test_no_activation_is_inactive(self, mock_st: MagicMock) -> None:
+        """No activation timestamp means access is inactive."""
+        assert _is_access_active() is False
+
+    def test_remaining_seconds_active(self, mock_st: MagicMock) -> None:
+        """Remaining seconds is positive when key was just entered."""
+        from datetime import datetime, timedelta
+
+        mock_st.session_state["_ask_key_activated_at"] = (
+            datetime.now() - timedelta(seconds=30)
+        )
+        remaining = _get_remaining_seconds()
+        assert 85 <= remaining <= 90  # ~1.5 minutes left
+
+    def test_remaining_seconds_expired(self, mock_st: MagicMock) -> None:
+        """Remaining seconds is zero when key is expired."""
+        from datetime import datetime, timedelta
+
+        mock_st.session_state["_ask_key_activated_at"] = (
+            datetime.now() - timedelta(minutes=10)
+        )
+        assert _get_remaining_seconds() == 0
+
+    def test_extract_expiry_date_valid(self, mock_st: MagicMock) -> None:
+        """A well-formed key returns a non-None expiry date."""
+        key = "1ut50bt52ir02kt6"
+        expiry = _extract_expiry_date(key)
+        assert expiry is not None
+        assert expiry.year > 2000
+
+    def test_extract_expiry_date_wrong_length(self, mock_st: MagicMock) -> None:
+        """Key with wrong length returns None."""
+        assert _extract_expiry_date("abc123def") is None
+        assert _extract_expiry_date("abcdefghijklmnopqrs") is None
+
+    def test_extract_expiry_date_no_digits_at_positions(
+        self, mock_st: MagicMock
+    ) -> None:
+        """All-letter 16-char key returns None."""
+        assert _extract_expiry_date("abcdefghijklmnop") is None
+
+    def test_key_not_expired_future_date(self, mock_st: MagicMock) -> None:
+        """Key with a future expiry date is not expired."""
+        # Pre-generated key expiring Sep 1, 2026.
+        assert _is_key_expired("0jm10pa92cq02aq6") is False
+
+    def test_key_expired_past_date(self, mock_st: MagicMock) -> None:
+        """Key with a past expiry date is expired."""
+        # Pre-generated key expiring Jan 1, 2020.
+        assert _is_key_expired("0rf10et12np02ma0") is True
+
+    def test_key_wrong_length_not_expired(self, mock_st: MagicMock) -> None:
+        """Key with wrong length is treated as non-expiring."""
+        assert _is_key_expired("short") is False

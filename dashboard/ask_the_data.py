@@ -6,11 +6,21 @@ and get verified, cited answers from the LangGraph ReAct agent.
 
 from __future__ import annotations
 
+import hmac
 import json
 import logging
 import os
 import re
+import sys
+from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Any
+
+# Ensure the project root is on sys.path so ``src.*`` imports resolve
+# regardless of the working directory Streamlit uses.
+_PROJECT_ROOT = str(Path(__file__).resolve().parent.parent)
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
 
 import httpx
 import streamlit as st
@@ -32,6 +42,12 @@ EXAMPLE_QUESTIONS: list[str] = [
 ]
 
 _REF_TAG_RE = re.compile(r"\[ref:(\d+)\]")
+
+_ACCESS_DURATION: timedelta = timedelta(minutes=2)
+"""How long an access key stays active after entry."""
+
+_DEFAULT_CONTACT_MSG: str = "See the project README for contact info."
+"""Fallback text when no contact_email is configured in secrets."""
 
 
 # ---------------------------------------------------------------------------
@@ -81,6 +97,36 @@ def _check_agent_available() -> tuple[bool, str | None]:
     return result
 
 
+def _check_cloud_provider() -> tuple[bool, str | None]:
+    """Detect whether a cloud API key is available (skip Ollama).
+
+    Checks Anthropic then OpenAI API keys in ``st.secrets`` or
+    environment variables.
+
+    Returns:
+        A ``(available, provider)`` tuple. ``provider`` is ``None``
+        when no API key is found.
+    """
+    if "_cloud_provider_available" in st.session_state:
+        return st.session_state["_cloud_provider_available"]
+
+    api_key = _get_secret("ANTHROPIC_API_KEY")
+    if api_key:
+        result: tuple[bool, str | None] = (True, "anthropic")
+        st.session_state["_cloud_provider_available"] = result
+        return result
+
+    api_key = _get_secret("OPENAI_API_KEY")
+    if api_key:
+        result = (True, "openai")
+        st.session_state["_cloud_provider_available"] = result
+        return result
+
+    result = (False, None)
+    st.session_state["_cloud_provider_available"] = result
+    return result
+
+
 def _get_secret(key: str) -> str | None:
     """Read a secret from Streamlit secrets or the environment.
 
@@ -97,6 +143,178 @@ def _get_secret(key: str) -> str | None:
     except Exception:  # noqa: BLE001
         pass
     return os.getenv(key)
+
+
+def _check_key_gate_required(provider: str | None) -> bool:
+    """Return whether the access-key gate should be shown.
+
+    The gate is required when using a cloud API provider (anthropic or
+    openai) to prevent unauthenticated API cost. Local Ollama usage is
+    always ungated.
+
+    Args:
+        provider: The detected LLM provider name.
+
+    Returns:
+        ``True`` if the user must enter an access key before using the
+        feature.
+    """
+    if provider == "ollama":
+        return False
+    # Gate is only meaningful if access keys are configured in secrets.
+    valid_keys = _get_access_keys()
+    return len(valid_keys) > 0
+
+
+def _get_access_keys() -> list[str]:
+    """Read the list of valid access keys from Streamlit secrets.
+
+    Returns:
+        A list of key strings, or an empty list if no keys are
+        configured.
+    """
+    try:
+        keys = st.secrets["access_keys"]["keys"]
+        if isinstance(keys, (list, tuple)):
+            return [str(k) for k in keys]
+    except (KeyError, FileNotFoundError, AttributeError):
+        pass
+    return []
+
+
+_KP = (0, 3, 4, 7, 8, 11, 12, 15)
+_KL = 16
+_KF = "%d%m%Y"
+
+
+def _extract_expiry_date(key: str) -> datetime | None:
+    """Extract the expiry date embedded in an access key.
+
+    Args:
+        key: An access key.
+
+    Returns:
+        The expiry ``datetime``, or ``None`` if not parseable.
+    """
+    if len(key) != _KL:
+        return None
+    digits = "".join(key[p] for p in _KP)
+    if not digits.isdigit():
+        return None
+    try:
+        return datetime.strptime(digits, _KF).replace(
+            hour=23, minute=59, second=59
+        )
+    except ValueError:
+        return None
+
+
+def _is_key_expired(key: str) -> bool:
+    """Check whether an access key has expired.
+
+    Args:
+        key: An access key.
+
+    Returns:
+        ``True`` if expired, ``False`` otherwise.
+    """
+    expiry = _extract_expiry_date(key)
+    if expiry is None:
+        return False
+    return datetime.now() > expiry
+
+
+def _get_contact_email() -> str:
+    """Read the contact email from Streamlit secrets.
+
+    Returns:
+        The configured email address, or a fallback message.
+    """
+    try:
+        email = st.secrets.get("contact_email")
+        if email:
+            return str(email)
+    except (FileNotFoundError, AttributeError):
+        pass
+    return _DEFAULT_CONTACT_MSG
+
+
+def _is_access_active() -> bool:
+    """Check whether a valid access key session is currently active.
+
+    Returns:
+        ``True`` if the key was entered less than ``_ACCESS_DURATION``
+        ago in this session.
+    """
+    activated_at: datetime | None = st.session_state.get(
+        "_ask_key_activated_at"
+    )
+    if activated_at is None:
+        return False
+    return datetime.now() - activated_at < _ACCESS_DURATION
+
+
+def _get_remaining_seconds() -> int:
+    """Return the number of seconds left in the current access window.
+
+    Returns:
+        Seconds remaining, or ``0`` if expired or not activated.
+    """
+    activated_at: datetime | None = st.session_state.get(
+        "_ask_key_activated_at"
+    )
+    if activated_at is None:
+        return 0
+    remaining = _ACCESS_DURATION - (datetime.now() - activated_at)
+    return max(0, int(remaining.total_seconds()))
+
+
+def _render_key_gate() -> None:
+    """Render the access-key entry UI with a feature preview.
+
+    Shows a description of what the feature does, example questions
+    as static text, a contact prompt, and a password input for the
+    access key.
+    """
+    st.markdown(
+        "Ask natural-language questions about the economic data and get "
+        "verified, cited answers. The AI agent queries the database, "
+        "retrieves reference sources, and fact-checks every claim."
+    )
+
+    # Show example questions as static preview text.
+    st.markdown("**Example questions:**")
+    for q in EXAMPLE_QUESTIONS:
+        st.markdown(f"- *{q}*")
+
+    # Check for expired session.
+    activated_at = st.session_state.get("_ask_key_activated_at")
+    if activated_at is not None and not _is_access_active():
+        st.warning("Access key expired. Enter a key to continue.")
+        st.session_state.pop("_ask_key_activated_at", None)
+
+    # Contact and key input.
+    contact = _get_contact_email()
+    st.info(f"Email **{contact}** for a 5-minute access key to try this feature.")
+
+    key_input = st.text_input(
+        "Access key",
+        type="password",
+        key="_ask_key_input",
+        placeholder="Paste your access key here",
+    )
+    if key_input:
+        valid_keys = _get_access_keys()
+        matched = any(
+            hmac.compare_digest(key_input, k) for k in valid_keys
+        )
+        if matched and _is_key_expired(key_input):
+            st.error("This access key has expired. Request a new one.")
+        elif matched:
+            st.session_state["_ask_key_activated_at"] = datetime.now()
+            st.rerun()
+        else:
+            st.error("Invalid access key.")
 
 
 def _build_agent_history(
@@ -184,7 +402,7 @@ def _render_claim_details(verification: dict[str, Any]) -> None:
         for r in results:
             rows.append({
                 "Claim": r.get("statement", ""),
-                "Expected": str(r.get("expected", "")),
+                "Expected": str(r.get("expected", "")) if r.get("expected") is not None else "N/A",
                 "Actual": str(r.get("actual_value", "")),
                 "Status": "Passed" if r.get("passed") else "Failed",
             })
@@ -241,6 +459,43 @@ def _format_ref_tags(text: str) -> str:
     return _REF_TAG_RE.sub(r"<sup>[\1]</sup>", text)
 
 
+def _render_countdown(remaining_seconds: int) -> None:
+    """Render a live JS countdown timer.
+
+    Args:
+        remaining_seconds: Seconds left in the access window.
+    """
+    import streamlit.components.v1 as components
+
+    components.html(
+        f"""
+        <div id="countdown" style="
+            font-size: 14px;
+            color: #888;
+            font-family: 'Source Sans Pro', sans-serif;
+        "></div>
+        <script>
+            let remaining = {remaining_seconds};
+            const el = document.getElementById('countdown');
+            function tick() {{
+                if (remaining <= 0) {{
+                    el.textContent = 'Access expired. Enter a key to continue.';
+                    el.style.color = '#e74c3c';
+                    return;
+                }}
+                const m = Math.floor(remaining / 60);
+                const s = remaining % 60;
+                el.textContent = 'Access expires in ' + m + ':' + String(s).padStart(2, '0');
+                remaining--;
+                setTimeout(tick, 1000);
+            }}
+            tick();
+        </script>
+        """,
+        height=30,
+    )
+
+
 def _render_history() -> None:
     """Render all past Q&A turns from session-state history."""
     history: list[dict[str, Any]] = st.session_state.get("_ask_history", [])
@@ -256,6 +511,10 @@ def _render_history() -> None:
             with st.chat_message("assistant"):
                 formatted = _format_ref_tags(content)
                 st.markdown(formatted, unsafe_allow_html=True)
+
+                elapsed = entry.get("elapsed_seconds")
+                if elapsed is not None:
+                    st.caption(f"Answered in {elapsed:.1f}s")
 
                 verification = entry.get("verification")
                 if verification:
@@ -292,14 +551,22 @@ def _handle_question(
     })
     st.session_state["_ask_history"] = history
 
+    model_name = _get_secret("AGENT_MODEL") or AgentConfig().model_name
     config = AgentConfig(
         provider=provider,
+        model_name=model_name,
         db_path=db_path,
         chroma_path=chroma_path,
     )
 
     try:
-        with st.spinner("Analyzing..."):
+        spinner_msg = (
+            "Querying the database and verifying claims "
+            "(this can take 10-15 seconds with Ollama)..."
+            if provider == "ollama"
+            else "Querying the database and verifying claims..."
+        )
+        with st.spinner(spinner_msg):
             cached_graph = _get_compiled_graph(
                 provider=config.provider,
                 model_name=config.model_name,
@@ -323,6 +590,7 @@ def _handle_question(
             "tool_calls": result.tool_calls,
             "tool_results": result.tool_results,
             "claims": result.claims,
+            "elapsed_seconds": result.elapsed_seconds,
         })
         st.session_state["_ask_history"] = history
     except Exception:
@@ -339,33 +607,59 @@ def _handle_question(
 # ---------------------------------------------------------------------------
 
 
-def render_ask_the_data(db_path: str, chroma_path: str) -> None:
+def render_ask_the_data(
+    db_path: str,
+    chroma_path: str,
+    force_local: bool = True,
+) -> None:
     """Render the Ask the Data chat UI section.
 
     Args:
         db_path: Absolute path to ``seed.db`` or ``full.db``.
         chroma_path: Absolute path to the ``.chroma/`` directory.
+        force_local: When ``True``, use Ollama (no key gate). When
+            ``False``, use the first available cloud API provider
+            and require an access key.
     """
     # --- Session state initialization ---
     if "_ask_history" not in st.session_state:
         st.session_state["_ask_history"] = []
 
     # --- Feature availability ---
-    available, provider = _check_agent_available()
+    if force_local:
+        available, provider = _check_agent_available()
+    else:
+        # Cloud mode: skip Ollama, look for an API key.
+        available, provider = _check_cloud_provider()
 
     if not available:
-        st.info(
-            "Ask the Data requires a local Ollama instance or an API key. "
-            "See the README for setup instructions."
-        )
+        if force_local:
+            st.info(
+                "Ask the Data requires a local Ollama instance. "
+                "See the README for setup instructions."
+            )
+        else:
+            st.info(
+                "Cloud mode requires an ANTHROPIC_API_KEY or OPENAI_API_KEY "
+                "in .streamlit/secrets.toml or environment variables."
+            )
         reconnect_col, _ = st.columns([1, 5])
         with reconnect_col:
             if st.button("Reconnect", key="_ask_reconnect"):
                 st.session_state.pop("_agent_available", None)
+                st.session_state.pop("_cloud_provider_available", None)
                 st.rerun()
         return
 
-    # --- Reconnect button (when available too, for provider switching) ---
+    # --- Access key gate (cloud providers only) ---
+    if _check_key_gate_required(provider):
+        if not _is_access_active():
+            _render_key_gate()
+            return
+        # Show live countdown via JS.
+        remaining = _get_remaining_seconds()
+        _render_countdown(remaining)
+
     # --- Example question chips ---
     cols = st.columns(2)
     for i, q in enumerate(EXAMPLE_QUESTIONS):

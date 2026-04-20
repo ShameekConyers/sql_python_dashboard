@@ -8,9 +8,13 @@ without needing SQL.
 
 from __future__ import annotations
 
+import logging
+
 from langchain_core.tools import tool
 
 from src.rag_retrieval import RetrievedChunk, retrieve
+
+logger: logging.Logger = logging.getLogger(__name__)
 
 _SNIPPET_MAX_CHARS: int = 150
 """Maximum characters of chunk content to include in the reference_block summary."""
@@ -80,7 +84,22 @@ def make_rag_tool():
         curve?" or "How is CPI measured?" without needing SQL. The result
         includes formatted reference context with [ref:N] citation tags.
         """
-        chunks: list[RetrievedChunk] = retrieve(query, k=5)
+        try:
+            chunks: list[RetrievedChunk] = retrieve(query, k=5)
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "RAG retrieval failed (ChromaDB unavailable or corrupt). "
+                "Returning empty results.",
+                exc_info=True,
+            )
+            return {
+                "chunks": [],
+                "reference_block": (
+                    "No reference context available (vector store "
+                    "unavailable). The agent can still answer using "
+                    "SQL queries."
+                ),
+            }
 
         chunk_dicts: list[dict] = [
             _chunk_to_dict(c, idx) for idx, c in enumerate(chunks, start=1)
